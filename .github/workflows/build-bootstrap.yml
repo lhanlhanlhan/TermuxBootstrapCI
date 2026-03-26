@@ -1,0 +1,347 @@
+name: Build Termux Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: '自定义包名 (e.g. com.mytermux)'
+        required: false
+        default: 'com.mytermux'
+      packages:
+        description: '额外软件包（逗号分隔, e.g. vim,curl,openssh）。留空 = 仅 bootstrap 基础包集'
+        required: false
+        default: ''
+      termux_packages_ref:
+        description: 'termux-packages 分支或 tag'
+        required: false
+        default: 'master'
+
+# Release 需要 contents: write；调试阶段可先不发 Release
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PACKAGE_NAME: ${{ inputs.package_name || 'com.mytermux' }}
+      EXTRA_PACKAGES: ${{ inputs.packages || '' }}
+      TERMUX_PACKAGES_REF: ${{ inputs.termux_packages_ref || 'master' }}
+      # 调试阶段仅 aarch64；未来可改为 input
+      TARGET_ARCH: 'aarch64'
+
+    steps:
+      # ============================================================
+      #  Phase 1: 系统准备
+      # ============================================================
+      - name: "🧹 释放磁盘空间"
+        run: |
+          echo "==> 清理前:"
+          df -h /
+          # 删除 GitHub Actions 预装的大型工具链
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/graalvm \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/julia* \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          docker image prune -af || true
+          echo "==> 清理后:"
+          df -h /
+
+      - name: "📥 克隆 termux-packages"
+        run: |
+          git clone --depth=1 --branch="${TERMUX_PACKAGES_REF}" \
+            https://github.com/termux/termux-packages.git
+          echo "==> 克隆完成 (ref: ${TERMUX_PACKAGES_REF})"
+          echo "==> 仓库关键文件检查:"
+          ls -la termux-packages/scripts/run-docker.sh       || { echo "❌ run-docker.sh 不存在！"; exit 1; }
+          ls -la termux-packages/scripts/properties.sh       || { echo "❌ properties.sh 不存在！"; exit 1; }
+          ls -la termux-packages/build-package.sh             || { echo "❌ build-package.sh 不存在！"; exit 1; }
+          # bootstrap 脚本检查（可能两者之一存在）
+          echo "--- bootstrap 脚本探测 ---"
+          ls -la termux-packages/scripts/generate-bootstraps.sh 2>/dev/null && echo "✅ generate-bootstraps.sh 存在" || echo "⚠️  generate-bootstraps.sh 不存在"
+          ls -la termux-packages/scripts/build-bootstrap.sh     2>/dev/null && echo "✅ build-bootstrap.sh 存在"     || echo "⚠️  build-bootstrap.sh 不存在"
+
+      # ============================================================
+      #  Phase 2: 配置自定义包名
+      # ============================================================
+      - name: "✏️  修改 properties.sh — 注入自定义包名"
+        run: |
+          PROPS="termux-packages/scripts/properties.sh"
+          echo "==> 修改前关键行:"
+          grep -n "TERMUX_APP_PACKAGE\|TERMUX_BASE_DIR\|TERMUX_HOME\|TERMUX_PREFIX\|TERMUX_CACHE_DIR\|/com\.termux" "$PROPS" || true
+
+          OLD_PKG="com.termux"
+          NEW_PKG="${PACKAGE_NAME}"
+
+          if [ "${OLD_PKG}" = "${NEW_PKG}" ]; then
+            echo "⚠️  包名与默认相同 (${OLD_PKG})，跳过修改"
+          else
+            # 全局替换所有 com.termux 引用（包含路径中的）
+            sed -i "s|${OLD_PKG}|${NEW_PKG}|g" "$PROPS"
+            echo "==> 已将所有 '${OLD_PKG}' 替换为 '${NEW_PKG}'"
+          fi
+
+          echo ""
+          echo "==> 修改后关键行:"
+          grep -n "TERMUX_APP_PACKAGE\|TERMUX_BASE_DIR\|TERMUX_HOME\|TERMUX_PREFIX\|TERMUX_CACHE_DIR\|/${NEW_PKG}" "$PROPS" || true
+
+          # 校验：确认没有残留的旧包名
+          if [ "${OLD_PKG}" != "${NEW_PKG}" ]; then
+            REMAINING=$(grep -c "${OLD_PKG}" "$PROPS" || true)
+            if [ "$REMAINING" -gt 0 ]; then
+              echo "⚠️  警告: properties.sh 中仍有 ${REMAINING} 处 '${OLD_PKG}' 未替换"
+              grep -n "${OLD_PKG}" "$PROPS"
+            else
+              echo "✅ 校验通过: properties.sh 中无残留旧包名"
+            fi
+          fi
+
+      # ============================================================
+      #  Phase 3: 为 CI 环境适配 Docker 脚本
+      # ============================================================
+      - name: "🐳 适配 run-docker.sh（移除 TTY 依赖）"
+        run: |
+          DOCKER_SCRIPT="termux-packages/scripts/run-docker.sh"
+
+          echo "==> 原始 run-docker.sh 中的 docker run 行:"
+          grep -n "docker run\|--tty\|-ti\b\|-it\b\| -t " "$DOCKER_SCRIPT" || true
+
+          # GitHub Actions 无真实 TTY，Docker 的 --tty/-t 标志会导致:
+          #   "the input device is not a TTY" 或输出混乱
+          # 策略：移除 -t/--tty，保留 -i/--interactive
+          sed -i \
+            -e 's/ --tty//g'     \
+            -e 's/"--tty"//g'    \
+            -e 's/ -ti / -i /g'  \
+            -e 's/ -it / -i /g'  \
+            -e 's/"-ti"/"-i"/g'  \
+            -e 's/"-it"/"-i"/g'  \
+            "$DOCKER_SCRIPT"
+
+          echo "==> 修改后的 docker run 行:"
+          grep -n "docker run\|-i\b\|--interactive" "$DOCKER_SCRIPT" || true
+
+          # 打印 Docker 镜像名称（便于排查镜像问题）
+          echo "==> 使用的 Docker 镜像:"
+          grep -oP '(?:TERMUX_DOCKER_IMAGE[=:]|docker\.io/|ghcr\.io/)\S+' "$DOCKER_SCRIPT" | head -3 || echo "(未能自动检测，请查看上方完整脚本)"
+
+      # ============================================================
+      #  Phase 4: 写入容器内构建脚本（避免 YAML→Shell 转义地狱）
+      # ============================================================
+      - name: "📝 生成容器内构建脚本"
+        run: |
+          cat > termux-packages/ci-build.sh << 'BUILDSCRIPT'
+          #!/usr/bin/env bash
+          # =======================================================
+          # ci-build.sh — 在 Docker 容器内执行
+          # 由 GitHub Actions workflow 自动生成，请勿手动编辑
+          # =======================================================
+          set -euo pipefail
+
+          echo "==========================================="
+          echo " Termux Bootstrap CI Build"
+          echo "==========================================="
+          echo " Date:         $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo " Architecture: ${CI_TARGET_ARCH}"
+          echo " Package Name: $(grep TERMUX_APP_PACKAGE scripts/properties.sh | head -1)"
+          echo " Extra Pkgs:   ${CI_EXTRA_PACKAGES:-none}"
+          echo " PWD:          $(pwd)"
+          echo " User:         $(whoami)"
+          echo "==========================================="
+          echo ""
+
+          # ----------------------------------------------------------
+          # Step 1: 构建额外软件包（如果指定了的话）
+          # ----------------------------------------------------------
+          if [ -n "${CI_EXTRA_PACKAGES:-}" ]; then
+            echo "==> [Step 1] 构建额外软件包..."
+            IFS=',' read -ra PKG_ARRAY <<< "${CI_EXTRA_PACKAGES}"
+            for pkg in "${PKG_ARRAY[@]}"; do
+              pkg=$(echo "${pkg}" | xargs)  # trim
+              [ -z "$pkg" ] && continue
+              echo ""
+              echo ">>> 构建: ${pkg} (${CI_TARGET_ARCH})"
+              ./build-package.sh -a "${CI_TARGET_ARCH}" "${pkg}" || {
+                echo "❌ 构建失败: ${pkg}"
+                echo "   如果是非必要包，可从 packages 列表中移除后重试"
+                exit 1
+              }
+              echo "✅ 构建成功: ${pkg}"
+            done
+          else
+            echo "==> [Step 1] 无额外软件包，跳过"
+          fi
+
+          # ----------------------------------------------------------
+          # Step 2: 生成 bootstrap zip
+          # ----------------------------------------------------------
+          echo ""
+          echo "==> [Step 2] 生成 bootstrap-${CI_TARGET_ARCH}.zip ..."
+
+          BOOTSTRAP_GENERATED=false
+
+          # 优先使用官方 generate-bootstraps.sh
+          if [ -f scripts/generate-bootstraps.sh ]; then
+            echo "    使用: scripts/generate-bootstraps.sh"
+            chmod +x scripts/generate-bootstraps.sh
+
+            # 检测脚本接受的参数格式
+            if grep -q "\-\-architectures" scripts/generate-bootstraps.sh; then
+              bash scripts/generate-bootstraps.sh --architectures "${CI_TARGET_ARCH}"
+            else
+              # 某些版本通过环境变量或无参数方式运行
+              echo "    ⚠️  脚本不接受 --architectures 参数，尝试直接运行..."
+              TERMUX_ARCH="${CI_TARGET_ARCH}" bash scripts/generate-bootstraps.sh
+            fi
+            BOOTSTRAP_GENERATED=true
+
+          # 回退: build-bootstrap.sh
+          elif [ -f scripts/build-bootstrap.sh ]; then
+            echo "    使用: scripts/build-bootstrap.sh (fallback)"
+            chmod +x scripts/build-bootstrap.sh
+            bash scripts/build-bootstrap.sh --architectures "${CI_TARGET_ARCH}"
+            BOOTSTRAP_GENERATED=true
+
+          else
+            echo "❌ 未找到任何 bootstrap 生成脚本！"
+            echo "   checked: scripts/generate-bootstraps.sh"
+            echo "   checked: scripts/build-bootstrap.sh"
+            echo ""
+            echo "   仓库 scripts/ 目录内容:"
+            ls -la scripts/
+            exit 1
+          fi
+
+          # ----------------------------------------------------------
+          # Step 3: 校验产物
+          # ----------------------------------------------------------
+          echo ""
+          echo "==> [Step 3] 检查构建产物..."
+
+          # 搜索所有可能的输出路径
+          echo "    搜索 bootstrap zip 文件..."
+          find . -name "bootstrap-*.zip" -type f 2>/dev/null | while read -r f; do
+            echo "    📦 ${f} ($(du -h "$f" | cut -f1))"
+          done
+
+          ZIP_COUNT=$(find . -name "bootstrap-*.zip" -type f 2>/dev/null | wc -l)
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "❌ 构建完成但未找到任何 bootstrap-*.zip！"
+            echo "   当前目录结构 (depth=2):"
+            find . -maxdepth 2 -type f -name "*.zip" -o -name "*.deb" | head -30
+            exit 1
+          fi
+
+          # 检查文件大小（bootstrap zip 通常 > 1MB）
+          find . -name "bootstrap-*.zip" -type f 2>/dev/null | while read -r f; do
+            SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+            if [ "$SIZE" -lt 1048576 ]; then
+              echo "⚠️  警告: ${f} 仅 ${SIZE} 字节，可能构建不完整"
+            fi
+          done
+
+          echo ""
+          echo "✅ Bootstrap 构建完成！"
+          BUILDSCRIPT
+
+          chmod +x termux-packages/ci-build.sh
+          echo "==> ci-build.sh 已生成 ($(wc -l < termux-packages/ci-build.sh) 行)"
+
+      # ============================================================
+      #  Phase 5: 执行构建
+      # ============================================================
+      - name: "🔨 在 Docker 中执行构建"
+        working-directory: termux-packages
+        env:
+          # 通过 run-docker.sh 的 -e 机制或在脚本中 export
+          # 由于 run-docker.sh 不一定转发 env，我们用 sed 写入脚本
+          CI_TARGET_ARCH_VAL: ${{ env.TARGET_ARCH }}
+          CI_EXTRA_PACKAGES_VAL: ${{ env.EXTRA_PACKAGES }}
+        run: |
+          # 将变量注入到 ci-build.sh 的开头
+          # 这样无论 Docker 是否转发 env 变量，脚本都能拿到值
+          sed -i "2i export CI_TARGET_ARCH=\"${CI_TARGET_ARCH_VAL}\"" ci-build.sh
+          sed -i "3i export CI_EXTRA_PACKAGES=\"${CI_EXTRA_PACKAGES_VAL}\"" ci-build.sh
+
+          echo "==> ci-build.sh 前 5 行:"
+          head -5 ci-build.sh
+          echo "..."
+          echo ""
+
+          echo "==> 当前磁盘空间:"
+          df -h /
+          echo ""
+
+          echo "==> 启动 Docker 构建环境..."
+          # run-docker.sh 会 pull 镜像并挂载当前目录到容器内
+          ./scripts/run-docker.sh bash ci-build.sh
+
+          echo ""
+          echo "==> Docker 构建完成，退出码: $?"
+
+      # ============================================================
+      #  Phase 6: 收集产物
+      # ============================================================
+      - name: "📦 收集构建产物"
+        if: always()
+        run: |
+          mkdir -p output
+
+          echo "==> 搜索 bootstrap zip 文件..."
+          FOUND=0
+          # 搜索所有可能的位置
+          find termux-packages -name "bootstrap-*.zip" -type f 2>/dev/null | while read -r f; do
+            cp "$f" output/
+            echo "    ✅ $(basename "$f") -> output/"
+          done
+          FOUND=$(ls output/bootstrap-*.zip 2>/dev/null | wc -l)
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "⚠️  未找到 bootstrap zip，收集调试信息..."
+            # 收集调试信息
+            find termux-packages -name "*.zip" -type f 2>/dev/null | head -20 > output/DEBUG_zip_files.txt || true
+            find termux-packages -name "*.deb" -type f 2>/dev/null | head -50 > output/DEBUG_deb_files.txt || true
+            cp termux-packages/scripts/properties.sh output/DEBUG_properties.sh 2>/dev/null || true
+            echo "FAILED - no bootstrap zip found" > output/DEBUG_status.txt
+          fi
+
+          # 生成构建信息
+          cat > output/BUILD_INFO.txt << EOF
+          Build Date:            $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Package Name:          ${PACKAGE_NAME}
+          Target Architecture:   ${TARGET_ARCH}
+          Extra Packages:        ${EXTRA_PACKAGES:-none}
+          termux-packages ref:   ${TERMUX_PACKAGES_REF}
+          Runner OS:             $(lsb_release -ds 2>/dev/null || echo "unknown")
+          Bootstrap files found: $(ls output/bootstrap-*.zip 2>/dev/null | wc -l)
+          EOF
+
+          echo ""
+          echo "==> output/ 目录内容:"
+          ls -lh output/
+
+          # 生成校验和
+          if ls output/bootstrap-*.zip 1>/dev/null 2>&1; then
+            echo ""
+            echo "==> SHA256 校验和:"
+            cd output && sha256sum bootstrap-*.zip | tee SHA256SUMS.txt
+          fi
+
+      - name: "⬆️  上传构建产物"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-bootstrap-${{ env.TARGET_ARCH }}-run${{ github.run_number }}
+          path: output/
+          retention-days: 90
+          if-no-files-found: warn
