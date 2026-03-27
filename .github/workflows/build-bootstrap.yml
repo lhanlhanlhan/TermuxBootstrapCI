@@ -95,7 +95,7 @@ jobs:
           set -euo pipefail
 
           echo "╔══════════════════════════════════════════════╗"
-          echo "║   Termux Custom Bootstrap Builder  (v5)      ║"
+          echo "║   Termux Custom Bootstrap Builder  (v6)      ║"
           echo "╚══════════════════════════════════════════════╝"
           echo ""
           echo "📋 构建环境信息:"
@@ -107,19 +107,13 @@ jobs:
           # ══════════════════════════════════════════════════════════
           # Step 0: 修复 Android SDK
           #
-          # v5: Docker 镜像内的 SDK 目录为 root 所有，builder 用户
-          #     无写入权限（chmod 也不行）。解决方案：
-          #     1) cp -a 整个 SDK 到 /tmp（可写）
-          #     2) 在新位置补装缺失的 build-tools 和 platform
-          #     3) 手动写 source.properties 让 Gradle 识别
-          #     4) 写一个全局 gradle.properties 强制 sdk.dir 指向新位置
+          # v5/v6: cp -a 到 /tmp/android-sdk (可写)，再补装缺失组件
           # ══════════════════════════════════════════════════════════
-          echo "🔧 Step 0: 安装 Android SDK 组件 (v5) ..."
+          echo "🔧 Step 0: 安装 Android SDK 组件 (v6) ..."
 
           ORIG_SDK=$(find /home/builder/lib -maxdepth 1 -name "android-sdk-*" -type d 2>/dev/null | head -1)
           SDK="/tmp/android-sdk"
 
-          # ── 0a: 复制原始 SDK 到 /tmp ─────────────────────────
           if [ -n "$ORIG_SDK" ]; then
             echo "  原始 SDK: $ORIG_SDK"
             echo "  复制到: $SDK ..."
@@ -134,15 +128,13 @@ jobs:
           export ANDROID_HOME="$SDK"
           export ANDROID_SDK_ROOT="$SDK"
 
-          # ── 0b: 诊断 ────────────────────────────────────────
-          echo ""
           echo "  📂 build-tools:"
           ls "$SDK/build-tools/" 2>/dev/null || echo "    (空)"
           echo "  📂 platforms:"
           ls "$SDK/platforms/" 2>/dev/null || echo "    (空)"
           echo ""
 
-          # ── 0c: 安装 build-tools;30.0.3 ─────────────────────
+          # ── build-tools;30.0.3 ──────────────────────────────
           BT_DIR="$SDK/build-tools/30.0.3"
           if [ -d "$BT_DIR" ] && { [ -f "$BT_DIR/aapt" ] || [ -f "$BT_DIR/aapt2" ]; }; then
             echo "  ✅ build-tools;30.0.3 已存在"
@@ -151,27 +143,18 @@ jobs:
             BT_ZIP="/tmp/bt.zip"
             curl -fSL --retry 3 -o "$BT_ZIP" \
               "https://dl.google.com/android/repository/build-tools_r30.0.3-linux.zip" 2>&1
-
             mkdir -p "$BT_DIR"
             TMP="/tmp/bt-ex-$$"
             mkdir -p "$TMP"
             unzip -q -o "$BT_ZIP" -d "$TMP"
-
-            # 找到包含 aapt/aapt2 的实际目录
             INNER=$(find "$TMP" -name "aapt2" -o -name "aapt" 2>/dev/null | head -1)
             [ -n "$INNER" ] && INNER=$(dirname "$INNER")
             [ -z "$INNER" ] && INNER=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)
-
             if [ -n "$INNER" ]; then
               cp -a "$INNER"/. "$BT_DIR/"
               echo "  ✅ build-tools 已安装"
-            else
-              echo "  ❌ zip 内容结构异常"
-              ls -R "$TMP/" | head -30
             fi
             rm -rf "$TMP" "$BT_ZIP"
-
-            # source.properties
             cat > "$BT_DIR/source.properties" << 'BTSP'
           Pkg.Revision=30.0.3
           Pkg.Path=build-tools;30.0.3
@@ -180,7 +163,7 @@ jobs:
             echo "  ✅ source.properties 已创建"
           fi
 
-          # ── 0d: 安装 platforms;android-33 ────────────────────
+          # ── platforms;android-33 ─────────────────────────────
           PLAT_DIR="$SDK/platforms/android-33"
           if [ -d "$PLAT_DIR" ] && [ -f "$PLAT_DIR/android.jar" ]; then
             echo "  ✅ platforms;android-33 已存在"
@@ -199,7 +182,6 @@ jobs:
                 PLAT_OK=true; break
               fi
             done
-
             if [ "$PLAT_OK" = true ]; then
               mkdir -p "$PLAT_DIR"
               TMP="/tmp/plat-ex-$$"
@@ -213,14 +195,10 @@ jobs:
               fi
               rm -rf "$TMP" "$PLAT_ZIP"
             else
-              echo "  ❌ 所有 URL 失败，尝试符号链接 fallback ..."
+              echo "  ❌ 所有 URL 失败，符号链接 fallback ..."
               EXISTING=$(find "$SDK/platforms" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
-              if [ -n "$EXISTING" ]; then
-                ln -sfn "$EXISTING" "$PLAT_DIR"
-                echo "  🔗 已链接 $EXISTING -> $PLAT_DIR"
-              fi
+              [ -n "$EXISTING" ] && ln -sfn "$EXISTING" "$PLAT_DIR"
             fi
-
             cat > "$PLAT_DIR/source.properties" << 'PLATSP'
           Pkg.Revision=3
           Pkg.Path=platforms;android-33
@@ -230,34 +208,23 @@ jobs:
             echo "  ✅ source.properties 已创建"
           fi
 
-          # ── 0e: licenses + 环境变量 ─────────────────────────
+          # ── licenses + gradle ────────────────────────────────
           mkdir -p "$SDK/licenses"
           printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee' > "$SDK/licenses/android-sdk-license"
           printf '\n84831b9409646a918e30573bab4c9c91346d8abd' > "$SDK/licenses/android-sdk-preview-license"
 
-          # ── 0f: 全局 gradle.properties 强制 sdk.dir ──────────
-          # Gradle 可能忽略 ANDROID_HOME 而去读 local.properties / gradle.properties
-          # 写入全局 gradle.properties 确保所有 Gradle 构建都能找到 SDK
           GRADLE_HOME="/home/builder/.gradle"
           mkdir -p "$GRADLE_HOME"
           echo "android.dir=$SDK" >> "$GRADLE_HOME/gradle.properties"
           echo "sdk.dir=$SDK"     >> "$GRADLE_HOME/gradle.properties"
-          echo "  ✅ ~/.gradle/gradle.properties 已写入 sdk.dir=$SDK"
+          echo "  ✅ licenses + gradle.properties 已写入"
 
-          # ── 0g: 最终验证 ─────────────────────────────────────
+          # ── 验证 ─────────────────────────────────────────────
           echo ""
           echo "  🔍 SDK 最终验证:"
           echo "    ANDROID_HOME=$ANDROID_HOME"
-          if [ -f "$BT_DIR/aapt2" ] || [ -f "$BT_DIR/aapt" ]; then
-            echo "    ✅ build-tools;30.0.3 → OK"
-          else
-            echo "    ❌ build-tools;30.0.3 → 缺失"
-          fi
-          if [ -f "$PLAT_DIR/android.jar" ]; then
-            echo "    ✅ platforms;android-33 → OK"
-          else
-            echo "    ❌ platforms;android-33 → 缺失"
-          fi
+          { [ -f "$BT_DIR/aapt2" ] || [ -f "$BT_DIR/aapt" ]; } && echo "    ✅ build-tools;30.0.3" || echo "    ❌ build-tools;30.0.3"
+          [ -f "$PLAT_DIR/android.jar" ] && echo "    ✅ platforms;android-33" || echo "    ❌ platforms;android-33"
           echo ""
 
           # ══════════════════════════════════════════════════════════
@@ -318,34 +285,63 @@ jobs:
 
           # ══════════════════════════════════════════════════════════
           # Step 2: 本地 apt 仓库
+          #
+          # v6 修复: generate-bootstraps.sh 用 $REPO_URL/$Filename 下载
+          #   .deb 文件。Packages 索引中的 Filename 字段是 dpkg-scanpackages
+          #   运行目录的相对路径。
+          #
+          #   v5 的问题: .deb 放在 dists/stable/main/binary-aarch64/ 下，
+          #   dpkg-scanpackages 也在该目录运行 → Filename = ./xxx.deb
+          #   → 实际 curl 路径 = $REPO_URL/xxx.deb = /tmp/local-termux-repo/xxx.deb
+          #   → 但文件在 dists/stable/main/binary-aarch64/xxx.deb → 404!
+          #
+          #   v6 修复: .deb 文件放到仓库根目录, dpkg-scanpackages 也从
+          #   根目录运行, Packages 索引复制到 dists/stable/main/binary-aarch64/。
           # ══════════════════════════════════════════════════════════
           echo "📂 Step 2: 创建本地 apt 仓库 ..."
 
           DEB_SOURCE="./output"
           LOCAL_REPO="/tmp/local-termux-repo"
-          REPO_DIR="${LOCAL_REPO}/dists/stable/main/binary-aarch64"
-          mkdir -p "$REPO_DIR"
+          PACKAGES_DIR="${LOCAL_REPO}/dists/stable/main/binary-aarch64"
+
+          mkdir -p "$LOCAL_REPO"
+          mkdir -p "$PACKAGES_DIR"
 
           DEB_COUNT=$(find "$DEB_SOURCE" -name "*.deb" -type f 2>/dev/null | wc -l)
           echo "  找到 $DEB_COUNT 个 .deb 文件"
           [ "$DEB_COUNT" -eq 0 ] && { echo "❌ 无 .deb 文件！"; exit 1; }
 
-          find "$DEB_SOURCE" -name "*.deb" -type f -exec cp {} "$REPO_DIR/" \;
+          # ⚠️ v6 关键修复: .deb 文件放到仓库根目录（不是 dists/ 子目录）
+          find "$DEB_SOURCE" -name "*.deb" -type f -exec cp {} "$LOCAL_REPO/" \;
 
           echo ""
           echo "  🔍 关键包检查:"
           for p in apt bash bzip2 curl xz-utils termux-core termux-tools termux-am; do
-            F=$(find "$DEB_SOURCE" -name "${p}_*.deb" -type f 2>/dev/null | head -1)
+            F=$(find "$LOCAL_REPO" -maxdepth 1 -name "${p}_*.deb" -type f 2>/dev/null | head -1)
             [ -n "$F" ] && echo "    ✅ $p" || echo "    ❌ $p"
           done
           echo ""
 
-          cd "$REPO_DIR"
+          # 从仓库根目录运行 dpkg-scanpackages → Filename 相对于根目录
+          cd "$LOCAL_REPO"
           dpkg-scanpackages --multiversion . /dev/null 2>/dev/null > Packages
           gzip -k Packages
+
           echo "  Packages 条目: $(grep -c '^Package:' Packages)"
+          echo "  Filename 示例: $(grep '^Filename:' Packages | head -1)"
+
+          # 将 Packages 索引复制到 apt 期望的目录结构
+          cp Packages Packages.gz "$PACKAGES_DIR/"
+
           cd /home/builder/termux-packages
 
+          # 同时创建 binary-all 目录（避免 curl error 37 警告）
+          ALL_DIR="${LOCAL_REPO}/dists/stable/main/binary-all"
+          mkdir -p "$ALL_DIR"
+          echo "" > "$ALL_DIR/Packages"
+          gzip -k "$ALL_DIR/Packages"
+
+          # Release 文件
           cat > "${LOCAL_REPO}/dists/stable/Release" << 'RELEASE_EOF'
           Origin: termux-custom
           Label: termux-custom
@@ -366,7 +362,7 @@ jobs:
           bash scripts/generate-bootstraps.sh \
             --repository "file://${LOCAL_REPO}" \
             --architectures aarch64 \
-            2>&1 | tail -50
+            2>&1 | tail -80
 
           echo ""
           find . -name "bootstrap-*.zip" -type f 2>/dev/null
@@ -376,14 +372,14 @@ jobs:
           SCRIPT_EOF
 
           chmod +x termux-packages/ci-build.sh
-          echo "✅ ci-build.sh 已生成 (v5)"
+          echo "✅ ci-build.sh 已生成 (v6)"
           echo ""
-          echo "=== v5 关键变更 ==="
-          echo "1. cp -a 整个 SDK 到 /tmp/android-sdk (可写副本)"
-          echo "2. curl 手动下载 build-tools + platform"
-          echo "3. 手动创建 source.properties + licenses"
-          echo "4. ~/.gradle/gradle.properties 写入 sdk.dir 确保 Gradle 能找到"
-          echo "5. 保留 v3/v4 所有修复"
+          echo "=== v6 关键变更 ==="
+          echo "1. 修复本地仓库布局: .deb 文件放到仓库根目录"
+          echo "2. dpkg-scanpackages 从根目录运行 (Filename 路径正确)"
+          echo "3. Packages 索引复制到 dists/stable/main/binary-aarch64/"
+          echo "4. 创建空的 binary-all/Packages 避免 curl 37 警告"
+          echo "5. 保留 v5 所有修复 (SDK 复制到 /tmp)"
 
       # ── Phase 5: Docker 构建 ─────────────────────────────────
       - name: "🐳 Docker 构建 (run-docker.sh)"
