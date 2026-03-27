@@ -51,7 +51,7 @@ jobs:
           echo "=== scripts/ 目录 ==="
           ls -la termux-packages/scripts/
 
-      # ── Phase 2: 修改 properties.sh ────────────────────────────
+      # ── Phase 2: 修改 properties.sh ───────────────────────────
       - name: "✏️  修改 properties.sh — 注入自定义包名"
         run: |
           PROPS="termux-packages/scripts/properties.sh"
@@ -95,7 +95,7 @@ jobs:
           echo "✅ 已插入 mkdir -p 补丁"
           grep -n "mkdir -p.*PROFILE_D" "$GEN" || echo "(验证 grep)"
 
-      # ── Phase 4: 生成 ci-build.sh ─────────────────────────────
+      # ── Phase 4: 生成 ci-build.sh ──────────────────────────────
       - name: "📝 生成构建脚本 ci-build.sh"
         run: |
           cat > termux-packages/ci-build.sh << 'SCRIPT_EOF'
@@ -103,7 +103,7 @@ jobs:
           set -euo pipefail
 
           echo "╔══════════════════════════════════════════════╗"
-          echo "║   Termux Custom Bootstrap Builder  (v3)      ║"
+          echo "║   Termux Custom Bootstrap Builder  (v4)      ║"
           echo "╚══════════════════════════════════════════════╝"
           echo ""
           echo "📋 构建环境信息:"
@@ -112,40 +112,269 @@ jobs:
           echo "  时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo ""
 
-          # ── Step 0: 修复 Android SDK (termux-am 依赖) ─────────
-          echo "🔧 Step 0: 检查 & 修复 Android SDK ..."
+          # ══════════════════════════════════════════════════════
+          # Step 0: 修复 Android SDK (termux-am 依赖)
+          #
+          # v4 核心修复:
+          #   Docker 容器的 AppArmor profile 阻止 sdkmanager (Java 进程)
+          #   写入 source.properties 文件，导致 SDK 组件无法通过 sdkmanager
+          #   正常安装。解决方案：完全绕过 sdkmanager，直接用 curl 下载
+          #   SDK 组件并手动创建 source.properties。
+          # ══════════════════════════════════════════════════════
+          echo "🔧 Step 0: 安装 Android SDK 组件 (v4 — 绕过 sdkmanager) ..."
           ANDROID_SDK_DIR=$(find /home/builder/lib -maxdepth 1 -name "android-sdk-*" -type d 2>/dev/null | head -1)
-          if [ -n "$ANDROID_SDK_DIR" ]; then
-            echo "  SDK 目录: $ANDROID_SDK_DIR"
-            chmod -R u+w "$ANDROID_SDK_DIR" 2>/dev/null || true
 
-            # 确保 cmdline-tools 在正确的目录结构下
+          if [ -z "$ANDROID_SDK_DIR" ]; then
+            echo "  ⚠️ 未找到 Android SDK 根目录，创建新目录 ..."
+            ANDROID_SDK_DIR="/home/builder/lib/android-sdk"
+            mkdir -p "$ANDROID_SDK_DIR"
+          fi
+
+          echo "  SDK 根目录: $ANDROID_SDK_DIR"
+          chmod -R u+w "$ANDROID_SDK_DIR" 2>/dev/null || true
+
+          # ── 诊断：列出当前已安装的 SDK 内容 ──────────────────
+          echo ""
+          echo "  📂 当前 SDK 目录结构:"
+          find "$ANDROID_SDK_DIR" -maxdepth 3 -type d 2>/dev/null | head -40
+          echo ""
+          echo "  📂 已有 build-tools 版本:"
+          ls -la "$ANDROID_SDK_DIR/build-tools/" 2>/dev/null || echo "    (无)"
+          echo "  📂 已有 platforms 版本:"
+          ls -la "$ANDROID_SDK_DIR/platforms/" 2>/dev/null || echo "    (无)"
+          echo ""
+
+          # ── 需要的 SDK 组件 ──────────────────────────────────
+          NEED_BT="30.0.3"
+          NEED_PLATFORM="33"
+          BT_DIR="$ANDROID_SDK_DIR/build-tools/$NEED_BT"
+          PLATFORM_DIR="$ANDROID_SDK_DIR/platforms/android-$NEED_PLATFORM"
+          SDK_OK=true
+
+          # ── Tier 1: 检查是否已经存在所需版本 ─────────────────
+          echo "  🔍 Tier 1: 检查已安装版本 ..."
+          if [ -d "$BT_DIR" ] && [ -f "$BT_DIR/aapt" -o -f "$BT_DIR/aapt2" ]; then
+            echo "    ✅ build-tools;$NEED_BT 已存在"
+          else
+            echo "    ❌ build-tools;$NEED_BT 未找到"
+            SDK_OK=false
+          fi
+
+          if [ -d "$PLATFORM_DIR" ] && [ -f "$PLATFORM_DIR/android.jar" ]; then
+            echo "    ✅ platforms;android-$NEED_PLATFORM 已存在"
+          else
+            echo "    ❌ platforms;android-$NEED_PLATFORM 未找到"
+            SDK_OK=false
+          fi
+
+          # ── Tier 2: sdkmanager 尝试安装（可能被 AppArmor 阻止）
+          if [ "$SDK_OK" = false ]; then
+            echo ""
+            echo "  🔧 Tier 2: 尝试 sdkmanager ..."
             SDKMANAGER=$(find "$ANDROID_SDK_DIR" -name "sdkmanager" -type f 2>/dev/null | head -1)
             if [ -n "$SDKMANAGER" ]; then
-              echo "  sdkmanager: $SDKMANAGER"
+              echo "    sdkmanager: $SDKMANAGER"
 
-              # 创建 latest 符号链接（sdkmanager 需要这个目录结构）
+              # 创建 latest 符号链接
               CMDLINE_DIR=$(dirname "$(dirname "$SDKMANAGER")")
               CMDLINE_PARENT=$(dirname "$CMDLINE_DIR")
               if [ ! -d "$CMDLINE_PARENT/latest" ]; then
                 ln -sf "$CMDLINE_DIR" "$CMDLINE_PARENT/latest" 2>/dev/null || true
-                echo "  已创建 cmdline-tools/latest 符号链接"
               fi
 
-              # 使用 --sdk_root 参数指定 SDK 根目录
-              yes 2>/dev/null | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_DIR" --licenses 2>&1 | tail -5 || true
-              "$SDKMANAGER" --sdk_root="$ANDROID_SDK_DIR" "platforms;android-33" "build-tools;30.0.3" 2>&1 | tail -10 || {
-                echo "  ⚠️ sdkmanager 安装组件失败 (非致命，继续构建)"
-              }
-
-              echo "  SDK 目录内容:"
-              ls -la "$ANDROID_SDK_DIR/" 2>/dev/null || true
+              yes 2>/dev/null | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_DIR" --licenses 2>&1 | tail -3 || true
+              "$SDKMANAGER" --sdk_root="$ANDROID_SDK_DIR" \
+                "platforms;android-$NEED_PLATFORM" "build-tools;$NEED_BT" \
+                2>&1 | tail -10 || echo "    ⚠️ sdkmanager 失败（预期，将用 curl 手动安装）"
             else
-              echo "  ⚠️ 未找到 sdkmanager"
+              echo "    ⚠️ sdkmanager 不存在，跳过"
             fi
-          else
-            echo "  ⚠️ 未找到 Android SDK 目录"
+
+            # 再次检查
+            if [ -d "$BT_DIR" ] && [ -f "$PLATFORM_DIR/android.jar" ] 2>/dev/null; then
+              echo "    ✅ sdkmanager 安装成功！"
+              SDK_OK=true
+            fi
           fi
+
+          # ── Tier 3: 手动 curl 下载 SDK 组件 ─────────────────
+          if [ "$SDK_OK" = false ]; then
+            echo ""
+            echo "  📥 Tier 3: 手动下载 SDK 组件 (curl) ..."
+
+            # ── build-tools;30.0.3 ──
+            if [ ! -d "$BT_DIR" ] || [ ! -f "$BT_DIR/aapt" -a ! -f "$BT_DIR/aapt2" ]; then
+              echo "    下载 build-tools;$NEED_BT ..."
+              BT_URL="https://dl.google.com/android/repository/build-tools_r${NEED_BT}-linux.zip"
+              BT_ZIP="/tmp/build-tools-${NEED_BT}.zip"
+              if curl -fSL --retry 3 --retry-delay 5 -o "$BT_ZIP" "$BT_URL" 2>&1; then
+                echo "    解压到 $BT_DIR ..."
+                mkdir -p "$BT_DIR"
+                # Google zip 内部通常有一层目录 android-XX 或 build-tools
+                TMP_EXTRACT="/tmp/bt-extract-$$"
+                mkdir -p "$TMP_EXTRACT"
+                unzip -q -o "$BT_ZIP" -d "$TMP_EXTRACT"
+                # 找到包含 aapt/aapt2 的目录
+                INNER_DIR=$(find "$TMP_EXTRACT" -name "aapt2" -type f -exec dirname {} \; 2>/dev/null | head -1)
+                if [ -z "$INNER_DIR" ]; then
+                  INNER_DIR=$(find "$TMP_EXTRACT" -name "aapt" -type f -exec dirname {} \; 2>/dev/null | head -1)
+                fi
+                if [ -n "$INNER_DIR" ]; then
+                  cp -a "$INNER_DIR"/. "$BT_DIR/"
+                  echo "    ✅ build-tools 文件已复制"
+                else
+                  # fallback: 复制解压目录里的第一个子目录
+                  FIRST_SUBDIR=$(find "$TMP_EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -1)
+                  if [ -n "$FIRST_SUBDIR" ]; then
+                    cp -a "$FIRST_SUBDIR"/. "$BT_DIR/"
+                    echo "    ✅ build-tools 文件已复制 (fallback)"
+                  fi
+                fi
+                rm -rf "$TMP_EXTRACT" "$BT_ZIP"
+
+                # 创建 source.properties（Gradle 用来识别已安装组件）
+                cat > "$BT_DIR/source.properties" << PROPS_EOF
+          Pkg.Revision=$NEED_BT
+          Pkg.Path=build-tools;$NEED_BT
+          Pkg.Desc=Android SDK Build-Tools $NEED_BT
+          PROPS_EOF
+                chmod 644 "$BT_DIR/source.properties"
+                echo "    ✅ source.properties 已创建"
+              else
+                echo "    ❌ build-tools 下载失败 (HTTP 错误)"
+              fi
+            fi
+
+            # ── platforms;android-33 ──
+            if [ ! -d "$PLATFORM_DIR" ] || [ ! -f "$PLATFORM_DIR/android.jar" ]; then
+              echo "    下载 platforms;android-$NEED_PLATFORM ..."
+              # platform-33 的 zip 文件名
+              PLAT_URL="https://dl.google.com/android/repository/platform-${NEED_PLATFORM}-ext7_r04.zip"
+              PLAT_ZIP="/tmp/platform-${NEED_PLATFORM}.zip"
+
+              # 尝试多个可能的 URL（Google 的命名规则不完全统一）
+              PLAT_URLS=(
+                "https://dl.google.com/android/repository/platform-${NEED_PLATFORM}-ext7_r04.zip"
+                "https://dl.google.com/android/repository/platform-${NEED_PLATFORM}_r03.zip"
+                "https://dl.google.com/android/repository/platform-${NEED_PLATFORM}_r02.zip"
+                "https://dl.google.com/android/repository/platform-${NEED_PLATFORM}_r01.zip"
+              )
+
+              PLAT_DOWNLOADED=false
+              for PLAT_URL in "${PLAT_URLS[@]}"; do
+                echo "    尝试: $PLAT_URL"
+                if curl -fSL --retry 2 --retry-delay 3 -o "$PLAT_ZIP" "$PLAT_URL" 2>&1; then
+                  echo "    ✅ 下载成功"
+                  PLAT_DOWNLOADED=true
+                  break
+                else
+                  echo "    ⚠️ 此 URL 不可用，尝试下一个"
+                fi
+              done
+
+              if [ "$PLAT_DOWNLOADED" = true ]; then
+                echo "    解压到 $PLATFORM_DIR ..."
+                mkdir -p "$PLATFORM_DIR"
+                TMP_EXTRACT="/tmp/plat-extract-$$"
+                mkdir -p "$TMP_EXTRACT"
+                unzip -q -o "$PLAT_ZIP" -d "$TMP_EXTRACT"
+                # 找到 android.jar 所在目录
+                INNER_DIR=$(find "$TMP_EXTRACT" -name "android.jar" -type f -exec dirname {} \; 2>/dev/null | head -1)
+                if [ -n "$INNER_DIR" ]; then
+                  cp -a "$INNER_DIR"/. "$PLATFORM_DIR/"
+                  echo "    ✅ platform 文件已复制"
+                else
+                  FIRST_SUBDIR=$(find "$TMP_EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -1)
+                  if [ -n "$FIRST_SUBDIR" ]; then
+                    cp -a "$FIRST_SUBDIR"/. "$PLATFORM_DIR/"
+                    echo "    ✅ platform 文件已复制 (fallback)"
+                  fi
+                fi
+                rm -rf "$TMP_EXTRACT" "$PLAT_ZIP"
+
+                cat > "$PLATFORM_DIR/source.properties" << PROPS_EOF
+          Pkg.Revision=3
+          Pkg.Path=platforms;android-$NEED_PLATFORM
+          Pkg.Desc=Android SDK Platform $NEED_PLATFORM
+          AndroidVersion.ApiLevel=$NEED_PLATFORM
+          PROPS_EOF
+                chmod 644 "$PLATFORM_DIR/source.properties"
+                echo "    ✅ source.properties 已创建"
+              else
+                echo "    ❌ 所有 platform URL 均下载失败"
+              fi
+            fi
+          fi
+
+          # ── Tier 4: 符号链接 fallback ────────────────────────
+          # 如果手动下载也失败，检查是否有其他版本可以借用
+          if [ ! -d "$BT_DIR" ] || { [ ! -f "$BT_DIR/aapt" ] && [ ! -f "$BT_DIR/aapt2" ]; }; then
+            echo ""
+            echo "  🔗 Tier 4: build-tools 符号链接 fallback ..."
+            EXISTING_BT=$(find "$ANDROID_SDK_DIR/build-tools" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+            if [ -n "$EXISTING_BT" ]; then
+              echo "    发现已安装版本: $EXISTING_BT"
+              ln -sfn "$EXISTING_BT" "$BT_DIR" 2>/dev/null || cp -a "$EXISTING_BT" "$BT_DIR"
+              # 确保 source.properties 中版本号匹配
+              cat > "$BT_DIR/source.properties" << PROPS_EOF
+          Pkg.Revision=$NEED_BT
+          Pkg.Path=build-tools;$NEED_BT
+          Pkg.Desc=Android SDK Build-Tools $NEED_BT
+          PROPS_EOF
+              echo "    ✅ 已创建符号链接: $EXISTING_BT -> $BT_DIR"
+            else
+              echo "    ⚠️ 无可用的 build-tools 版本进行 fallback"
+            fi
+          fi
+
+          if [ ! -d "$PLATFORM_DIR" ] || [ ! -f "$PLATFORM_DIR/android.jar" ]; then
+            echo ""
+            echo "  🔗 Tier 4: platforms 符号链接 fallback ..."
+            EXISTING_PLAT=$(find "$ANDROID_SDK_DIR/platforms" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
+            if [ -n "$EXISTING_PLAT" ]; then
+              echo "    发现已安装版本: $EXISTING_PLAT"
+              ln -sfn "$EXISTING_PLAT" "$PLATFORM_DIR" 2>/dev/null || cp -a "$EXISTING_PLAT" "$PLATFORM_DIR"
+              cat > "$PLATFORM_DIR/source.properties" << PROPS_EOF
+          Pkg.Revision=3
+          Pkg.Path=platforms;android-$NEED_PLATFORM
+          Pkg.Desc=Android SDK Platform $NEED_PLATFORM
+          AndroidVersion.ApiLevel=$NEED_PLATFORM
+          PROPS_EOF
+              echo "    ✅ 已创建符号链接: $EXISTING_PLAT -> $PLATFORM_DIR"
+            else
+              echo "    ⚠️ 无可用的 platforms 版本进行 fallback"
+            fi
+          fi
+
+          # ── 最终验证 ─────────────────────────────────────────
+          echo ""
+          echo "  🔍 SDK 最终验证:"
+          if [ -d "$BT_DIR" ]; then
+            echo "    ✅ build-tools;$NEED_BT → $(ls "$BT_DIR/" | head -10 | tr '\n' ' ')"
+            echo "    source.properties: $(cat "$BT_DIR/source.properties" 2>/dev/null | head -1)"
+          else
+            echo "    ❌ build-tools;$NEED_BT 仍缺失！"
+          fi
+
+          if [ -d "$PLATFORM_DIR" ] && [ -f "$PLATFORM_DIR/android.jar" ]; then
+            echo "    ✅ platforms;android-$NEED_PLATFORM → android.jar 存在"
+            echo "    source.properties: $(cat "$PLATFORM_DIR/source.properties" 2>/dev/null | head -1)"
+          else
+            echo "    ❌ platforms;android-$NEED_PLATFORM 仍缺失！"
+          fi
+
+          # 确保 ANDROID_HOME / ANDROID_SDK_ROOT 被正确设置
+          export ANDROID_HOME="$ANDROID_SDK_DIR"
+          export ANDROID_SDK_ROOT="$ANDROID_SDK_DIR"
+          echo ""
+          echo "  ANDROID_HOME=$ANDROID_HOME"
+          echo "  ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+          # 确保 licenses 目录存在（Gradle 也会检查）
+          mkdir -p "$ANDROID_SDK_DIR/licenses"
+          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_SDK_DIR/licenses/android-sdk-license"
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_SDK_DIR/licenses/android-sdk-preview-license"
+          echo "  ✅ SDK licenses 已写入"
           echo ""
 
           # ── Step 1: 构建所有 bootstrap 基础包 ──────────────────
@@ -156,7 +385,7 @@ jobs:
           #   curl 是 libcurl 的子包
           #   xz-utils 是 liblzma 的子包
           #
-          # ⚠️ v3 关键修复：不使用 -I 标志！
+          # ⚠️ 不使用 -I 标志！
           #   -I 会从官方 Termux 仓库下载预编译的依赖包，
           #   这些包的路径写死为 com.termux，对自定义包名无效。
           #   不加 -I 则从源码编译所有依赖，确保路径正确。
@@ -209,7 +438,6 @@ jobs:
             echo "  $(date -u '+%H:%M:%S UTC')"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            # ⚠️ v3: 去掉 -I 标志，从源码编译所有依赖
             if bash build-package.sh -a aarch64 "$PKG" 2>&1 | tail -50; then
               echo "  ✅ $PKG 构建成功 ($(date -u '+%H:%M:%S UTC'))"
               SUCCESS=$((SUCCESS + 1))
@@ -229,7 +457,7 @@ jobs:
           echo "══════════════════════════════════════════"
           echo ""
 
-          # ── Step 1.5: 构建额外用户指定的包 ────────────────────
+          # ── Step 1.5: 构建额外用户指定的包 ─────────────────────
           EXTRA_PACKAGES_RAW="${EXTRA_PACKAGES:-}"
           if [ -n "$EXTRA_PACKAGES_RAW" ]; then
             echo "📦 Step 1.5: 构建额外包 ..."
@@ -245,7 +473,7 @@ jobs:
             echo ""
           fi
 
-          # ── Step 2: 创建本地 apt 仓库 ─────────────────────────
+          # ── Step 2: 创建本地 apt 仓库 ──────────────────────────
           echo "📂 Step 2: 创建本地 apt 仓库 ..."
 
           DEB_SOURCE="./output"
@@ -271,7 +499,7 @@ jobs:
           echo "  仓库中的 .deb 文件:"
           ls -la "$REPO_DIR/"*.deb 2>/dev/null | head -60
 
-          # ── 关键 bootstrap 包检查 ──────────────────────────────
+          # ── 关键 bootstrap 包检查 ─────────────────────────────
           echo ""
           echo "  🔍 关键 bootstrap 包检查:"
           for check_pkg in apt bash bzip2 curl xz-utils termux-core termux-tools termux-am; do
@@ -304,7 +532,7 @@ jobs:
           echo "  ✅ 本地仓库创建完成: $LOCAL_REPO"
           echo ""
 
-          # ── Step 3: 生成 bootstrap zip ─────────────────────────
+          # ── Step 3: 生成 bootstrap zip ────────────────────────
           echo "🎯 Step 3: 生成 bootstrap.zip ..."
           echo "  仓库路径: file://${LOCAL_REPO}"
 
@@ -323,14 +551,15 @@ jobs:
           SCRIPT_EOF
 
           chmod +x termux-packages/ci-build.sh
-          echo "✅ ci-build.sh 已生成 (v3)"
+          echo "✅ ci-build.sh 已生成 (v4)"
           echo ""
-          echo "=== v3 关键变更 ==="
-          echo "1. build-package.sh 不再使用 -I 标志（从源码编译依赖）"
-          echo "2. sdkmanager 使用 --sdk_root 参数"
-          echo "3. 每个包输出带时间戳便于追踪进度"
+          echo "=== v4 关键变更 ==="
+          echo "1. 全新 Step 0: 四级 SDK 安装策略 (检查已有 → sdkmanager → curl 手动下载 → 符号链接)"
+          echo "2. 手动创建 source.properties 让 Gradle 识别 SDK 组件"
+          echo "3. 手动写入 SDK licenses 文件"
+          echo "4. 保留 v3 所有修复 (无 -I 标志, sed 转义, profile.d 补丁)"
 
-      # ── Phase 5: Docker 构建 ───────────────────────────────────
+      # ── Phase 5: Docker 构建 ─────────────────────────────────
       - name: "🐳 Docker 构建 (run-docker.sh)"
         working-directory: termux-packages
         env:
@@ -345,7 +574,7 @@ jobs:
 
           bash scripts/run-docker.sh bash ci-build.sh
 
-      # ── Phase 6: 收集产物 ──────────────────────────────────────
+      # ── Phase 6: 收集产物 ─────────────────────────────────────
       - name: "📦 收集构建产物"
         if: always()
         run: |
