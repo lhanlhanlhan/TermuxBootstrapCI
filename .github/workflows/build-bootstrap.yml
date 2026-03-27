@@ -31,144 +31,124 @@ jobs:
       TARGET_ARCH: 'aarch64'
 
     steps:
-      # ============================================================
-      #  Phase 1: 系统准备
-      # ============================================================
-      - name: "🧹 释放磁盘空间"
+      # ── Phase 1: 系统准备 ──────────────────────────────────────
+      - name: "🧹 清理磁盘空间"
         run: |
-          echo "==> 清理前:"
+          echo "=== 清理前磁盘使用 ==="
           df -h /
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /usr/local/share/boost \
-            /usr/share/swift \
-            /usr/local/graalvm \
-            /usr/local/share/powershell \
-            /usr/local/share/chromium \
-            /usr/local/julia* \
-            /opt/hostedtoolcache/CodeQL || true
-          sudo apt-get clean || true
-          docker image prune -af || true
-          echo "==> 清理后:"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /usr/local/share/boost /opt/hostedtoolcache
+          sudo apt-get clean
+          echo "=== 清理后磁盘使用 ==="
           df -h /
 
       - name: "📥 克隆 termux-packages"
         run: |
           git clone --depth=1 --branch="${TERMUX_PACKAGES_REF}" \
             https://github.com/termux/termux-packages.git
-          echo "==> 克隆完成 (ref: ${TERMUX_PACKAGES_REF})"
+          echo "=== 仓库结构 ==="
+          ls -la termux-packages/
+          echo "=== scripts/ 目录 ==="
+          ls -la termux-packages/scripts/
 
-      - name: "🔍 检查仓库结构"
-        run: |
-          echo "==> 关键文件:"
-          for f in scripts/run-docker.sh scripts/properties.sh build-package.sh scripts/generate-bootstraps.sh; do
-            [ -f "termux-packages/$f" ] && echo "  ✅ $f" || { echo "  ❌ $f 不存在！"; exit 1; }
-          done
-          echo ""
-          echo "==> properties.sh 完整内容:"
-          cat -n termux-packages/scripts/properties.sh
-
-      # ============================================================
-      #  Phase 2: 配置自定义包名
-      # ============================================================
+      # ── Phase 2: 修改 properties.sh ────────────────────────────
       - name: "✏️  修改 properties.sh — 注入自定义包名"
         run: |
           PROPS="termux-packages/scripts/properties.sh"
           OLD_PKG="com.termux"
           NEW_PKG="${PACKAGE_NAME}"
 
-          if [ "${OLD_PKG}" = "${NEW_PKG}" ]; then
-            echo "⚠️  包名与默认相同，跳过修改"
-            exit 0
+          echo "=== 修改前关键行 ==="
+          grep -n "com\.termux" "$PROPS" | head -20
+
+          # ⚠️ 转义 . 为 \. 确保只匹配字面量点号，不会误伤 URL 中的 com/termux
+          OLD_PKG_ESCAPED=$(echo "${OLD_PKG}" | sed 's/\./\\./g')
+          echo "sed 匹配模式: ${OLD_PKG_ESCAPED}"
+
+          sed -i "s|${OLD_PKG_ESCAPED}|${NEW_PKG}|g" "$PROPS"
+
+          echo "=== 修改后关键行 ==="
+          grep -n "${NEW_PKG}" "$PROPS" | head -20
+
+          # URL 完整性校验 —— 如果 github.com/termux 被误改成 github.com.xxx 就报错
+          BROKEN_URLS=$(grep -c "github\.com\.${NEW_PKG}" "$PROPS" || true)
+          if [ "$BROKEN_URLS" -gt 0 ]; then
+            echo "❌ 检测到 URL 被误替换！以下行包含损坏的 URL:"
+            grep "github\.com\.${NEW_PKG}" "$PROPS"
+            exit 1
           fi
+          echo "✅ URL 完整性校验通过"
 
-          echo "==> 替换: '${OLD_PKG}' → '${NEW_PKG}'"
-          sed -i "s|${OLD_PKG}|${NEW_PKG}|g" "$PROPS"
+          # 最终确认 TERMUX_APP_PACKAGE 值
+          echo "=== TERMUX_APP_PACKAGE 最终值 ==="
+          grep "TERMUX_APP_PACKAGE" "$PROPS"
 
-          echo ""
-          echo "==> 修改后完整内容:"
-          cat -n "$PROPS"
-
-          echo ""
-          REMAINING=$(grep -c "${OLD_PKG}" "$PROPS" || true)
-          if [ "$REMAINING" -gt 0 ]; then
-            echo "⚠️  仍有 ${REMAINING} 处 '${OLD_PKG}' 未替换:"
-            grep -n "${OLD_PKG}" "$PROPS"
-          else
-            echo "✅ 校验通过: 无残留旧包名"
-          fi
-
-      # ============================================================
-      #  Phase 3: 补丁 generate-bootstraps.sh
-      #
-      #  修复: add_termux_bootstrap_second_stage_files() 写入
-      #  profile.d 目录前未 mkdir -p, 导致自定义包名时路径不存在。
-      #  原因: 从本地仓库拉取的 .deb 虽然路径正确, 但 profile.d
-      #  目录需要由 bootstrap 脚本自行创建。
-      # ============================================================
-      - name: "🩹 补丁 generate-bootstraps.sh — 修复 mkdir 缺失"
+      # ── Phase 3: 补丁 generate-bootstraps.sh ───────────────────
+      - name: "🩹 补丁 generate-bootstraps.sh — 修复 profile.d 目录缺失"
         run: |
-          GEN_SCRIPT="termux-packages/scripts/generate-bootstraps.sh"
+          GEN="termux-packages/scripts/generate-bootstraps.sh"
 
-          echo "==> 在 add_termux_bootstrap_second_stage_files() 中注入 mkdir -p"
+          # 在写入 profile.d 文件之前插入 mkdir -p
+          # 匹配 add_termux_bootstrap_second_stage_files() 中写文件的行
+          sed -i '/cat <<-TERMUX_BOOTSTRAP_SECOND_STAGE_DONE/i\
+          mkdir -p "${TERMUX__PREFIX__PROFILE_D_DIR}"' "$GEN"
 
-          # 在写入 profile.d fallback 文件前, 确保目录存在
-          # 定位: "# TODO: Remove it when Termux app supports" 注释行之前插入 mkdir
-          sed -i '/# TODO: Remove it when Termux app supports/i\\tmkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}"' "$GEN_SCRIPT"
+          echo "✅ 已插入 mkdir -p 补丁"
+          grep -n "mkdir -p.*PROFILE_D" "$GEN" || echo "(验证 grep)"
 
-          echo "==> 验证补丁:"
-          grep -n "mkdir.*PROFILE_D_DIR\|mkdir.*BOOTSTRAP_SECOND_STAGE" "$GEN_SCRIPT" || echo "⚠️ 未找到 mkdir 行"
-
-          echo ""
-          echo "==> add_termux_bootstrap_second_stage_files 函数完整内容:"
-          sed -n '/^add_termux_bootstrap_second_stage_files/,/^}/p' "$GEN_SCRIPT"
-
-      # ============================================================
-      #  Phase 4: 生成容器内构建脚本
-      #
-      #  核心策略（自定义包名）:
-      #    1. 用 build-package.sh 从源码编译全部 bootstrap 包
-      #       → 读取修改后的 properties.sh → 路径含自定义包名
-      #    2. 用编译产物搭建本地 apt 仓库 (dpkg-scanpackages)
-      #    3. generate-bootstraps.sh --repository file:///... 
-      #       → 从本地仓库拉包 → 路径全部正确
-      #
-      #  写入独立 .sh 文件，彻底避免 YAML→Shell→Docker 转义地狱。
-      #  变量通过 sed 注入脚本头部。
-      # ============================================================
-      - name: "📝 生成容器内构建脚本"
+      # ── Phase 4: 生成 ci-build.sh ─────────────────────────────
+      - name: "📝 生成构建脚本 ci-build.sh"
         run: |
-          cat > termux-packages/ci-build.sh << 'BUILDSCRIPT'
+          cat > termux-packages/ci-build.sh << 'SCRIPT_EOF'
           #!/usr/bin/env bash
           set -euo pipefail
 
-          echo "==========================================="
-          echo " Termux Bootstrap CI Build (Source Build)"
-          echo "==========================================="
-          echo " Date:         $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo " Architecture: ${CI_TARGET_ARCH}"
-          echo " Extra Pkgs:   ${CI_EXTRA_PACKAGES:-none}"
-          echo " PWD:          $(pwd)"
-          echo " User:         $(whoami) (UID=$(id -u))"
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║   Termux Custom Bootstrap Builder            ║"
+          echo "╚══════════════════════════════════════════════╝"
           echo ""
-          echo " properties.sh 包名相关变量:"
-          grep -E "^[^#]*TERMUX_APP|^[^#]*TERMUX_BASE_DIR|^[^#]*TERMUX_HOME|^[^#]*TERMUX_PREFIX" scripts/properties.sh || true
-          echo "==========================================="
+          echo "📋 构建环境信息:"
+          echo "  TERMUX_APP_PACKAGE = $(grep TERMUX_APP_PACKAGE= scripts/properties.sh | head -1)"
+          echo "  架构: aarch64"
+          echo "  时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo ""
 
-          # ----------------------------------------------------------
-          # Bootstrap 基础包列表
-          # 来自 generate-bootstraps.sh 中的 pull_package 调用
-          # ----------------------------------------------------------
-          BOOTSTRAP_PACKAGES=(
+          # ── Step 0: 修复 Android SDK (termux-am 依赖) ─────────
+          echo "🔧 Step 0: 检查 & 修复 Android SDK ..."
+          ANDROID_SDK_DIR=$(find /home/builder/lib -maxdepth 1 -name "android-sdk-*" -type d 2>/dev/null | head -1)
+          if [ -n "$ANDROID_SDK_DIR" ]; then
+            echo "  SDK 目录: $ANDROID_SDK_DIR"
+            chmod -R u+w "$ANDROID_SDK_DIR" 2>/dev/null || true
+
+            SDKMANAGER=$(find "$ANDROID_SDK_DIR" -name "sdkmanager" -type f 2>/dev/null | head -1)
+            if [ -n "$SDKMANAGER" ]; then
+              echo "  sdkmanager: $SDKMANAGER"
+              yes 2>/dev/null | "$SDKMANAGER" --licenses 2>&1 | tail -5 || true
+              "$SDKMANAGER" "platforms;android-33" "build-tools;30.0.3" 2>&1 | tail -10 || {
+                echo "  ⚠️ sdkmanager 安装组件失败 (非致命，继续构建)"
+              }
+            else
+              echo "  ⚠️ 未找到 sdkmanager"
+            fi
+          else
+            echo "  ⚠️ 未找到 Android SDK 目录"
+          fi
+          echo ""
+
+          # ── Step 1: 构建所有 bootstrap 基础包 ──────────────────
+          echo "📦 Step 1: 构建 bootstrap 基础包 ..."
+
+          # ⚠️ 使用【父包名】而非子包名：
+          #   bzip2 是 libbz2 的子包
+          #   curl 是 libcurl 的子包
+          #   xz-utils 是 liblzma 的子包
+          BUILD_PACKAGES=(
             apt
             bash
-            bzip2
+            libbz2
             command-not-found
             coreutils
-            curl
+            libcurl
             dash
             diffutils
             findutils
@@ -185,7 +165,7 @@ jobs:
             termux-keyring
             termux-tools
             util-linux
-            xz-utils
+            liblzma
             ed
             debianutils
             dos2unix
@@ -197,309 +177,177 @@ jobs:
             unzip
           )
 
-          # ----------------------------------------------------------
-          # Step 1: 从源码构建所有 bootstrap 包
-          #
-          # build-package.sh 读取 properties.sh, 使用修改后的
-          # TERMUX_APP_PACKAGE 和 TERMUX_PREFIX, 编译出的 .deb
-          # 内部路径将包含自定义包名。
-          # ----------------------------------------------------------
-          echo "==> [Step 1] 从源码构建 bootstrap 包..."
-          echo "    共 ${#BOOTSTRAP_PACKAGES[@]} 个基础包"
+          TOTAL=${#BUILD_PACKAGES[@]}
+          SUCCESS=0
+          FAILED=0
+          FAILED_LIST=""
 
-          FAILED_PACKAGES=()
-          BUILT_COUNT=0
-
-          for pkg in "${BOOTSTRAP_PACKAGES[@]}"; do
+          for i in "${!BUILD_PACKAGES[@]}"; do
+            PKG="${BUILD_PACKAGES[$i]}"
+            NUM=$((i + 1))
             echo ""
-            echo ">>> [${BUILT_COUNT}/${#BOOTSTRAP_PACKAGES[@]}] 构建: ${pkg} (${CI_TARGET_ARCH})"
-            if bash build-package.sh -a "${CI_TARGET_ARCH}" "${pkg}"; then
-              BUILT_COUNT=$((BUILT_COUNT + 1))
-              echo "✅ 构建成功: ${pkg} (${BUILT_COUNT}/${#BOOTSTRAP_PACKAGES[@]})"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "  [$NUM/$TOTAL] 构建: $PKG"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            if bash build-package.sh -a aarch64 -I "$PKG" 2>&1 | tail -30; then
+              echo "  ✅ $PKG 构建成功"
+              SUCCESS=$((SUCCESS + 1))
             else
-              echo "⚠️  构建失败: ${pkg}, 继续下一个..."
-              FAILED_PACKAGES+=("${pkg}")
+              echo "  ❌ $PKG 构建失败 (exit code: $?)"
+              FAILED=$((FAILED + 1))
+              FAILED_LIST="${FAILED_LIST} ${PKG}"
             fi
           done
 
           echo ""
-          echo "==> 基础包构建完成: ${BUILT_COUNT}/${#BOOTSTRAP_PACKAGES[@]} 成功"
-          if [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
-            echo "⚠️  失败的包: ${FAILED_PACKAGES[*]}"
+          echo "══════════════════════════════════════════"
+          echo "  基础包构建完成: $SUCCESS/$TOTAL 成功"
+          if [ $FAILED -gt 0 ]; then
+            echo "  失败的包: $FAILED_LIST"
           fi
-
-          # ----------------------------------------------------------
-          # Step 1.5: 构建额外软件包（如有）
-          # ----------------------------------------------------------
-          if [ -n "${CI_EXTRA_PACKAGES:-}" ]; then
-            echo ""
-            echo "==> [Step 1.5] 构建额外软件包..."
-            IFS=',' read -ra EXTRA_ARRAY <<< "${CI_EXTRA_PACKAGES}"
-            for pkg in "${EXTRA_ARRAY[@]}"; do
-              pkg=$(echo "${pkg}" | xargs)
-              [ -z "$pkg" ] && continue
-              echo ""
-              echo ">>> 构建额外包: ${pkg} (${CI_TARGET_ARCH})"
-              if bash build-package.sh -a "${CI_TARGET_ARCH}" "${pkg}"; then
-                echo "✅ 构建成功: ${pkg}"
-              else
-                echo "⚠️  构建失败: ${pkg}"
-                FAILED_PACKAGES+=("${pkg}")
-              fi
-            done
-          else
-            echo "==> [Step 1.5] 无额外软件包，跳过"
-          fi
-
-          # ----------------------------------------------------------
-          # Step 2: 搭建本地 apt 仓库
-          #
-          # build-package.sh 产出的 .deb 位于:
-          #   output/ 或 debs/ 目录
-          # 我们用 dpkg-scanpackages 生成 Packages 索引文件,
-          # 构造 generate-bootstraps.sh 可消费的本地仓库结构。
-          #
-          # 仓库结构:
-          #   /tmp/local-repo/dists/stable/main/binary-{arch}/Packages
-          #   /tmp/local-repo/pool/*.deb
-          # ----------------------------------------------------------
+          echo "══════════════════════════════════════════"
           echo ""
-          echo "==> [Step 2] 搭建本地 apt 仓库..."
 
-          LOCAL_REPO="/tmp/local-repo"
-          REPO_POOL="${LOCAL_REPO}"
-          REPO_DIST="${LOCAL_REPO}/dists/stable/main/binary-${CI_TARGET_ARCH}"
-          REPO_DIST_ALL="${LOCAL_REPO}/dists/stable/main/binary-all"
-
-          mkdir -p "${REPO_POOL}" "${REPO_DIST}" "${REPO_DIST_ALL}"
-
-          # 定位 .deb 文件输出目录
-          DEB_SOURCE=""
-          if [ -d "output" ] && ls output/*.deb 1>/dev/null 2>&1; then
-            DEB_SOURCE="output"
-          elif [ -d "debs" ] && ls debs/*.deb 1>/dev/null 2>&1; then
-            DEB_SOURCE="debs"
-          else
-            echo "    搜索 .deb 文件..."
-            DEB_SOURCE=$(find . -maxdepth 2 -name "*.deb" -type f -print -quit | xargs -r dirname)
+          # ── Step 1.5: 构建额外用户指定的包 ────────────────────
+          EXTRA_PACKAGES_RAW="${EXTRA_PACKAGES:-}"
+          if [ -n "$EXTRA_PACKAGES_RAW" ]; then
+            echo "📦 Step 1.5: 构建额外包 ..."
+            IFS=',' read -ra EXTRA_PKGS <<< "$EXTRA_PACKAGES_RAW"
+            for PKG in "${EXTRA_PKGS[@]}"; do
+              PKG=$(echo "$PKG" | xargs)  # trim whitespace
+              [ -z "$PKG" ] && continue
+              echo "  构建额外包: $PKG"
+              bash build-package.sh -a aarch64 -I "$PKG" 2>&1 | tail -20 || {
+                echo "  ⚠️ 额外包 $PKG 构建失败 (非致命)"
+              }
+            done
+            echo ""
           fi
 
-          if [ -z "${DEB_SOURCE}" ]; then
-            echo "❌ 未找到任何 .deb 文件！"
-            echo "   构建输出目录内容:"
-            ls -la output/ 2>/dev/null || true
-            ls -la debs/ 2>/dev/null || true
+          # ── Step 2: 创建本地 apt 仓库 ─────────────────────────
+          echo "📂 Step 2: 创建本地 apt 仓库 ..."
+
+          DEB_SOURCE="./output"
+          LOCAL_REPO="/tmp/local-termux-repo"
+          REPO_DIR="${LOCAL_REPO}/dists/stable/main/binary-aarch64"
+
+          mkdir -p "$REPO_DIR"
+
+          echo "  从 $DEB_SOURCE 收集 .deb 文件 ..."
+          DEB_COUNT=$(find "${DEB_SOURCE}" -name "*.deb" -type f 2>/dev/null | wc -l)
+          echo "  找到 $DEB_COUNT 个 .deb 文件"
+
+          if [ "$DEB_COUNT" -eq 0 ]; then
+            echo "❌ 没有找到任何 .deb 文件！无法继续。"
+            echo "  检查 output/ 目录:"
+            ls -la "${DEB_SOURCE}/" 2>/dev/null || echo "  output/ 目录不存在"
             exit 1
           fi
 
-          echo "    .deb 来源目录: ${DEB_SOURCE}"
-          DEB_COUNT=$(find "${DEB_SOURCE}" -name "*.deb" -type f | wc -l)
-          echo "    找到 ${DEB_COUNT} 个 .deb 文件"
+          # 复制所有 .deb 到仓库目录
+          find "${DEB_SOURCE}" -name "*.deb" -type f -exec cp {} "$REPO_DIR/" \;
 
-          # 复制所有 .deb 到仓库根目录（pool）
-          # generate-bootstraps.sh 的 Filename 字段是相对路径
-          find "${DEB_SOURCE}" -name "*.deb" -type f -exec cp {} "${REPO_POOL}/" \;
+          echo "  仓库中的 .deb 文件:"
+          ls -la "$REPO_DIR/"*.deb 2>/dev/null | head -40
+
+          # ── 关键 bootstrap 包检查 ──────────────────────────────
+          echo ""
+          echo "  🔍 关键 bootstrap 包检查:"
+          for check_pkg in apt bash bzip2 curl xz-utils termux-core termux-tools termux-am; do
+            FOUND=$(find "${DEB_SOURCE}" -name "${check_pkg}_*.deb" -type f 2>/dev/null | head -1)
+            if [ -n "$FOUND" ]; then
+              echo "    ✅ ${check_pkg}: $(basename "$FOUND")"
+            else
+              echo "    ❌ ${check_pkg}: 未找到 .deb"
+            fi
+          done
+          echo ""
 
           # 生成 Packages 索引
-          echo "    生成 Packages 索引..."
-          cd "${LOCAL_REPO}"
+          cd "$REPO_DIR"
+          dpkg-scanpackages --multiversion . /dev/null 2>/dev/null > Packages
+          gzip -k Packages
+          echo "  Packages 索引条目数: $(grep -c '^Package:' Packages)"
+          cd /home/builder/termux-packages
 
-          # dpkg-scanpackages 可能不可用, 用 Python 脚本生成
-          # 这样更可靠, 不依赖额外工具安装
-          python3 - "${CI_TARGET_ARCH}" << 'PYEOF'
-          import os, sys, subprocess, hashlib, email.parser
+          # 生成 Release 文件
+          cat > "${LOCAL_REPO}/dists/stable/Release" << 'RELEASE_EOF'
+          Origin: termux-custom
+          Label: termux-custom
+          Suite: stable
+          Codename: stable
+          Architectures: aarch64
+          Components: main
+          RELEASE_EOF
 
-          arch = sys.argv[1]
-          repo_root = os.getcwd()
-
-          # 收集所有 .deb
-          deb_files = [f for f in os.listdir(repo_root) if f.endswith('.deb')]
-          print(f"    处理 {len(deb_files)} 个 .deb 文件...")
-
-          entries_arch = []
-          entries_all = []
-
-          for deb in sorted(deb_files):
-              deb_path = os.path.join(repo_root, deb)
-              size = os.path.getsize(deb_path)
-
-              # 计算 MD5, SHA256
-              md5 = hashlib.md5()
-              sha256 = hashlib.sha256()
-              with open(deb_path, 'rb') as f:
-                  for chunk in iter(lambda: f.read(8192), b''):
-                      md5.update(chunk)
-                      sha256.update(chunk)
-
-              # 提取 control 文件
-              try:
-                  result = subprocess.run(
-                      ['dpkg-deb', '--field', deb_path],
-                      capture_output=True, text=True, timeout=30
-                  )
-                  if result.returncode != 0:
-                      print(f"    ⚠️  跳过 {deb}: dpkg-deb 失败")
-                      continue
-                  control = result.stdout.strip()
-              except Exception as e:
-                  print(f"    ⚠️  跳过 {deb}: {e}")
-                  continue
-
-              # 解析 architecture
-              parser = email.parser.Parser()
-              msg = parser.parsestr(control)
-              pkg_arch = msg.get('Architecture', 'all').strip()
-
-              # 构造 Packages 条目
-              entry = control + "\n"
-              entry += f"Filename: {deb}\n"
-              entry += f"Size: {size}\n"
-              entry += f"MD5sum: {md5.hexdigest()}\n"
-              entry += f"SHA256: {sha256.hexdigest()}\n"
-
-              if pkg_arch == 'all':
-                  entries_all.append(entry)
-              else:
-                  entries_arch.append(entry)
-
-          # 写入 Packages 文件
-          dist_arch = f"dists/stable/main/binary-{arch}"
-          dist_all = "dists/stable/main/binary-all"
-
-          with open(os.path.join(dist_arch, "Packages"), 'w') as f:
-              f.write("\n".join(entries_arch) + "\n")
-          print(f"    写入 {dist_arch}/Packages ({len(entries_arch)} 条)")
-
-          with open(os.path.join(dist_all, "Packages"), 'w') as f:
-              f.write("\n".join(entries_all) + "\n")
-          print(f"    写入 {dist_all}/Packages ({len(entries_all)} 条)")
-          PYEOF
-
-          cd "${OLDPWD}"
-
-          echo "    ✅ 本地仓库就绪: ${LOCAL_REPO}"
-          echo "    仓库结构:"
-          find "${LOCAL_REPO}/dists" -type f | head -10
-
-          # ----------------------------------------------------------
-          # Step 3: 用 generate-bootstraps.sh 组装 bootstrap
-          #
-          # 关键: --repository file:///tmp/local-repo
-          # 脚本将从本地仓库拉包, 路径全部为自定义包名。
-          # ----------------------------------------------------------
+          echo "  ✅ 本地仓库创建完成: $LOCAL_REPO"
           echo ""
-          echo "==> [Step 3] 生成 bootstrap-${CI_TARGET_ARCH}.zip ..."
-          echo "    使用本地仓库: file://${LOCAL_REPO}"
+
+          # ── Step 3: 生成 bootstrap zip ─────────────────────────
+          echo "🎯 Step 3: 生成 bootstrap.zip ..."
+          echo "  仓库路径: file://${LOCAL_REPO}"
 
           bash scripts/generate-bootstraps.sh \
             --repository "file://${LOCAL_REPO}" \
-            --architectures "${CI_TARGET_ARCH}"
-
-          # ----------------------------------------------------------
-          # Step 4: 校验产物
-          # ----------------------------------------------------------
-          echo ""
-          echo "==> [Step 4] 检查构建产物..."
-          find . -name "bootstrap-*.zip" -type f 2>/dev/null | while read -r f; do
-            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            echo "    📦 ${f} ($(du -h "$f" | cut -f1), ${SIZE} bytes)"
-            if [ "$SIZE" -lt 1048576 ]; then
-              echo "    ⚠️  文件过小，可能不完整"
-            fi
-          done
-
-          ZIP_COUNT=$(find . -name "bootstrap-*.zip" -type f 2>/dev/null | wc -l)
-          if [ "$ZIP_COUNT" -eq 0 ]; then
-            echo "❌ 未找到 bootstrap-*.zip！"
-            echo "   所有 zip/deb 文件:"
-            find . -maxdepth 3 \( -name "*.zip" -o -name "*.deb" \) -type f | head -30
-            exit 1
-          fi
-
-          if [ ${#FAILED_PACKAGES[@]} -gt 0 ]; then
-            echo ""
-            echo "⚠️  注意: 以下包构建失败, bootstrap 可能不完整:"
-            echo "    ${FAILED_PACKAGES[*]}"
-          fi
+            --architectures aarch64 \
+            2>&1 | tail -50
 
           echo ""
-          echo "✅ Bootstrap 构建完成！"
-          BUILDSCRIPT
+          echo "🔍 查找生成的 bootstrap 文件 ..."
+          find . -name "bootstrap-*.zip" -type f 2>/dev/null
+          ls -lh bootstrap-*.zip 2>/dev/null || echo "  未找到 bootstrap zip"
 
-          # 注入变量到脚本头部（宿主机侧操作，无权限问题）
-          sed -i "2i export CI_TARGET_ARCH=\"${TARGET_ARCH}\"" termux-packages/ci-build.sh
-          sed -i "3i export CI_EXTRA_PACKAGES=\"${EXTRA_PACKAGES}\"" termux-packages/ci-build.sh
+          echo ""
+          echo "✅ 构建流程完成！"
+          SCRIPT_EOF
 
-          echo "==> ci-build.sh 前 6 行:"
-          head -6 termux-packages/ci-build.sh
+          chmod +x termux-packages/ci-build.sh
+          echo "✅ ci-build.sh 已生成"
+          echo "=== 脚本内容预览 (前 30 行) ==="
+          head -30 termux-packages/ci-build.sh
 
-      # ============================================================
-      #  Phase 5: 执行构建
-      #
-      #  run-docker.sh 会:
-      #    1. pull 镜像 ghcr.io/termux/package-builder
-      #    2. docker run --detach 创建持久容器
-      #    3. 映射 UID/GID (如需要)
-      #    4. 加载 AppArmor profile
-      #    5. docker exec 执行传入的命令
-      #  TTY 自动检测 ([ -t 1 ])，CI 下不加 --tty。
-      # ============================================================
-      - name: "🔨 在 Docker 中执行构建"
+      # ── Phase 5: Docker 构建 ───────────────────────────────────
+      - name: "🐳 Docker 构建 (run-docker.sh)"
         working-directory: termux-packages
+        env:
+          EXTRA_PACKAGES: ${{ env.EXTRA_PACKAGES }}
         run: |
-          echo "==> 当前磁盘:"
-          df -h /
+          echo "=== 启动 Docker 构建 ==="
+          echo "  包名: ${PACKAGE_NAME}"
+          echo "  架构: aarch64"
+          echo "  额外包: ${EXTRA_PACKAGES:-无}"
           echo ""
-          echo "==> 启动构建（通过 run-docker.sh）..."
-          echo "    ⏱  预计耗时: 2-4 小时（从源码编译 ~30 个包）"
-          ./scripts/run-docker.sh bash ci-build.sh
 
-      # ============================================================
-      #  Phase 6: 收集产物
-      # ============================================================
+          bash scripts/run-docker.sh bash ci-build.sh
+
+      # ── Phase 6: 收集产物 ──────────────────────────────────────
       - name: "📦 收集构建产物"
         if: always()
         run: |
-          mkdir -p output
+          echo "=== 查找所有 bootstrap zip ==="
+          find termux-packages -name "bootstrap-*.zip" -type f 2>/dev/null
 
-          echo "==> 搜索 bootstrap zip..."
-          find termux-packages -name "bootstrap-*.zip" -type f 2>/dev/null | while read -r f; do
-            cp "$f" output/
-            echo "  ✅ $(basename "$f") → output/"
-          done
-
-          FOUND=$(ls output/bootstrap-*.zip 2>/dev/null | wc -l || echo 0)
-          if [ "$FOUND" -eq 0 ]; then
-            echo "⚠️  未找到 bootstrap zip，收集调试信息..."
-            find termux-packages -name "*.zip" -type f 2>/dev/null | head -20 > output/DEBUG_zip_files.txt || true
-            find termux-packages -name "*.deb" -type f 2>/dev/null | head -50 > output/DEBUG_deb_files.txt || true
-            cp termux-packages/scripts/properties.sh output/DEBUG_properties.sh 2>/dev/null || true
+          BOOTSTRAP=$(find termux-packages -name "bootstrap-aarch64.zip" -type f 2>/dev/null | head -1)
+          if [ -n "$BOOTSTRAP" ]; then
+            echo "✅ 找到: $BOOTSTRAP"
+            ls -lh "$BOOTSTRAP"
+            cp "$BOOTSTRAP" ./bootstrap-aarch64.zip
+          else
+            echo "⚠️ 未找到 bootstrap-aarch64.zip"
+            echo "=== termux-packages 根目录文件 ==="
+            ls -la termux-packages/
+            echo "=== 查找所有 .zip ==="
+            find termux-packages -name "*.zip" -type f 2>/dev/null
           fi
 
-          {
-            echo "Build Date:          $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo "Package Name:        ${PACKAGE_NAME}"
-            echo "Target Architecture: ${TARGET_ARCH}"
-            echo "Extra Packages:      ${EXTRA_PACKAGES:-none}"
-            echo "termux-packages ref: ${TERMUX_PACKAGES_REF}"
-            echo "Bootstrap files:     ${FOUND}"
-          } > output/BUILD_INFO.txt
-
-          echo ""
-          echo "==> output/ 内容:"
-          ls -lh output/
-
-          if ls output/bootstrap-*.zip 1>/dev/null 2>&1; then
-            echo ""
-            echo "==> SHA256:"
-            cd output && sha256sum bootstrap-*.zip | tee SHA256SUMS.txt
-          fi
-
-      - name: "⬆️  上传构建产物"
+      - name: "⬆️  上传 Artifact"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: termux-bootstrap-${{ env.TARGET_ARCH }}-run${{ github.run_number }}
-          path: output/
-          retention-days: 90
+          name: termux-bootstrap-${{ env.PACKAGE_NAME }}-aarch64
+          path: |
+            bootstrap-aarch64.zip
+            termux-packages/output/*.deb
           if-no-files-found: warn
+          retention-days: 30
