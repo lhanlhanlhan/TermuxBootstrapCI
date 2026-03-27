@@ -89,7 +89,6 @@ jobs:
           GEN="termux-packages/scripts/generate-bootstraps.sh"
 
           # 在写入 profile.d 文件之前插入 mkdir -p
-          # 匹配 add_termux_bootstrap_second_stage_files() 中写文件的行
           sed -i '/cat <<-TERMUX_BOOTSTRAP_SECOND_STAGE_DONE/i\
           mkdir -p "${TERMUX__PREFIX__PROFILE_D_DIR}"' "$GEN"
 
@@ -104,7 +103,7 @@ jobs:
           set -euo pipefail
 
           echo "╔══════════════════════════════════════════════╗"
-          echo "║   Termux Custom Bootstrap Builder            ║"
+          echo "║   Termux Custom Bootstrap Builder  (v3)      ║"
           echo "╚══════════════════════════════════════════════╝"
           echo ""
           echo "📋 构建环境信息:"
@@ -120,13 +119,27 @@ jobs:
             echo "  SDK 目录: $ANDROID_SDK_DIR"
             chmod -R u+w "$ANDROID_SDK_DIR" 2>/dev/null || true
 
+            # 确保 cmdline-tools 在正确的目录结构下
             SDKMANAGER=$(find "$ANDROID_SDK_DIR" -name "sdkmanager" -type f 2>/dev/null | head -1)
             if [ -n "$SDKMANAGER" ]; then
               echo "  sdkmanager: $SDKMANAGER"
-              yes 2>/dev/null | "$SDKMANAGER" --licenses 2>&1 | tail -5 || true
-              "$SDKMANAGER" "platforms;android-33" "build-tools;30.0.3" 2>&1 | tail -10 || {
+
+              # 创建 latest 符号链接（sdkmanager 需要这个目录结构）
+              CMDLINE_DIR=$(dirname "$(dirname "$SDKMANAGER")")
+              CMDLINE_PARENT=$(dirname "$CMDLINE_DIR")
+              if [ ! -d "$CMDLINE_PARENT/latest" ]; then
+                ln -sf "$CMDLINE_DIR" "$CMDLINE_PARENT/latest" 2>/dev/null || true
+                echo "  已创建 cmdline-tools/latest 符号链接"
+              fi
+
+              # 使用 --sdk_root 参数指定 SDK 根目录
+              yes 2>/dev/null | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_DIR" --licenses 2>&1 | tail -5 || true
+              "$SDKMANAGER" --sdk_root="$ANDROID_SDK_DIR" "platforms;android-33" "build-tools;30.0.3" 2>&1 | tail -10 || {
                 echo "  ⚠️ sdkmanager 安装组件失败 (非致命，继续构建)"
               }
+
+              echo "  SDK 目录内容:"
+              ls -la "$ANDROID_SDK_DIR/" 2>/dev/null || true
             else
               echo "  ⚠️ 未找到 sdkmanager"
             fi
@@ -142,6 +155,11 @@ jobs:
           #   bzip2 是 libbz2 的子包
           #   curl 是 libcurl 的子包
           #   xz-utils 是 liblzma 的子包
+          #
+          # ⚠️ v3 关键修复：不使用 -I 标志！
+          #   -I 会从官方 Termux 仓库下载预编译的依赖包，
+          #   这些包的路径写死为 com.termux，对自定义包名无效。
+          #   不加 -I 则从源码编译所有依赖，确保路径正确。
           BUILD_PACKAGES=(
             apt
             bash
@@ -188,13 +206,15 @@ jobs:
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "  [$NUM/$TOTAL] 构建: $PKG"
+            echo "  $(date -u '+%H:%M:%S UTC')"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            if bash build-package.sh -a aarch64 -I "$PKG" 2>&1 | tail -30; then
-              echo "  ✅ $PKG 构建成功"
+            # ⚠️ v3: 去掉 -I 标志，从源码编译所有依赖
+            if bash build-package.sh -a aarch64 "$PKG" 2>&1 | tail -50; then
+              echo "  ✅ $PKG 构建成功 ($(date -u '+%H:%M:%S UTC'))"
               SUCCESS=$((SUCCESS + 1))
             else
-              echo "  ❌ $PKG 构建失败 (exit code: $?)"
+              echo "  ❌ $PKG 构建失败 (exit code: $?) ($(date -u '+%H:%M:%S UTC'))"
               FAILED=$((FAILED + 1))
               FAILED_LIST="${FAILED_LIST} ${PKG}"
             fi
@@ -218,7 +238,7 @@ jobs:
               PKG=$(echo "$PKG" | xargs)  # trim whitespace
               [ -z "$PKG" ] && continue
               echo "  构建额外包: $PKG"
-              bash build-package.sh -a aarch64 -I "$PKG" 2>&1 | tail -20 || {
+              bash build-package.sh -a aarch64 "$PKG" 2>&1 | tail -20 || {
                 echo "  ⚠️ 额外包 $PKG 构建失败 (非致命)"
               }
             done
@@ -249,7 +269,7 @@ jobs:
           find "${DEB_SOURCE}" -name "*.deb" -type f -exec cp {} "$REPO_DIR/" \;
 
           echo "  仓库中的 .deb 文件:"
-          ls -la "$REPO_DIR/"*.deb 2>/dev/null | head -40
+          ls -la "$REPO_DIR/"*.deb 2>/dev/null | head -60
 
           # ── 关键 bootstrap 包检查 ──────────────────────────────
           echo ""
@@ -303,9 +323,12 @@ jobs:
           SCRIPT_EOF
 
           chmod +x termux-packages/ci-build.sh
-          echo "✅ ci-build.sh 已生成"
-          echo "=== 脚本内容预览 (前 30 行) ==="
-          head -30 termux-packages/ci-build.sh
+          echo "✅ ci-build.sh 已生成 (v3)"
+          echo ""
+          echo "=== v3 关键变更 ==="
+          echo "1. build-package.sh 不再使用 -I 标志（从源码编译依赖）"
+          echo "2. sdkmanager 使用 --sdk_root 参数"
+          echo "3. 每个包输出带时间戳便于追踪进度"
 
       # ── Phase 5: Docker 构建 ───────────────────────────────────
       - name: "🐳 Docker 构建 (run-docker.sh)"
@@ -317,6 +340,7 @@ jobs:
           echo "  包名: ${PACKAGE_NAME}"
           echo "  架构: aarch64"
           echo "  额外包: ${EXTRA_PACKAGES:-无}"
+          echo "  ⏱  预计耗时: 2-4 小时（从源码编译所有包及其依赖）"
           echo ""
 
           bash scripts/run-docker.sh bash ci-build.sh
