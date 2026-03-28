@@ -62,8 +62,6 @@ jobs:
           grep -n "com\.termux" "$PROPS" | head -20
 
           OLD_PKG_ESCAPED=$(echo "${OLD_PKG}" | sed 's/\./\\./g')
-          echo "sed 匹配模式: ${OLD_PKG_ESCAPED}"
-
           sed -i "s|${OLD_PKG_ESCAPED}|${NEW_PKG}|g" "$PROPS"
 
           echo "=== 修改后关键行 ==="
@@ -72,20 +70,40 @@ jobs:
           BROKEN_URLS=$(grep -c "github\.com\.${NEW_PKG}" "$PROPS" || true)
           if [ "$BROKEN_URLS" -gt 0 ]; then
             echo "❌ 检测到 URL 被误替换！"
-            grep "github\.com\.${NEW_PKG}" "$PROPS"
             exit 1
           fi
           echo "✅ URL 完整性校验通过"
           grep "TERMUX_APP_PACKAGE" "$PROPS"
 
       # ── Phase 3: 补丁 generate-bootstraps.sh ───────────────────
-      - name: "🩹 补丁 generate-bootstraps.sh — 修复 profile.d 目录缺失"
+      - name: "🩹 补丁 generate-bootstraps.sh"
         run: |
           GEN="termux-packages/scripts/generate-bootstraps.sh"
+
+          # 补丁 1: 在写入 profile.d 文件之前插入 mkdir -p
           sed -i '/cat <<-TERMUX_BOOTSTRAP_SECOND_STAGE_DONE/i\
           mkdir -p "${TERMUX__PREFIX__PROFILE_D_DIR}"' "$GEN"
-          echo "✅ 已插入 mkdir -p 补丁"
-          grep -n "mkdir -p.*PROFILE_D" "$GEN" || echo "(验证 grep)"
+          echo "✅ 补丁 1: 已插入 mkdir -p profile.d"
+
+          # 补丁 2 (v7): generate-bootstraps.sh 最后会执行
+          #   mv "${BOOTSTRAP_TMPDIR}/bootstrap-${arch}.zip" ./
+          # 但 Docker 内的 CWD (termux-packages 根目录) 对 builder 用户不可写。
+          # ./output/ 目录可写（build-package.sh 在那里输出 .deb）。
+          # 将 mv 目标从 ./ 改为 ./output/
+          echo ""
+          echo "=== 补丁 2: 修改 bootstrap zip 输出路径 ==="
+          echo "  修改前的 mv 行:"
+          grep -n 'mv.*bootstrap.*\.zip' "$GEN" || echo "  (未找到精确匹配)"
+
+          # 方式 A: 处理 ./ 结尾的行
+          sed -i '/mv.*bootstrap.*\.zip/s| \.\/*\s*$| ./output/|' "$GEN"
+          # 方式 B: 处理引号包裹的 "./" 或 "."
+          sed -i '/mv.*bootstrap.*\.zip/s|"\.\/*"|"./output/"|' "$GEN"
+
+          echo "  修改后的 mv 行:"
+          grep -n 'mv.*bootstrap.*\.zip' "$GEN" || echo "  (未找到)"
+
+          echo "✅ 补丁 2: bootstrap zip 输出路径已修改"
 
       # ── Phase 4: 生成 ci-build.sh ──────────────────────────────
       - name: "📝 生成构建脚本 ci-build.sh"
@@ -95,7 +113,7 @@ jobs:
           set -euo pipefail
 
           echo "╔══════════════════════════════════════════════╗"
-          echo "║   Termux Custom Bootstrap Builder  (v6)      ║"
+          echo "║   Termux Custom Bootstrap Builder  (v7)      ║"
           echo "╚══════════════════════════════════════════════╝"
           echo ""
           echo "📋 构建环境信息:"
@@ -105,71 +123,55 @@ jobs:
           echo ""
 
           # ══════════════════════════════════════════════════════════
-          # Step 0: 修复 Android SDK
-          #
-          # v5/v6: cp -a 到 /tmp/android-sdk (可写)，再补装缺失组件
+          # Step 0: 修复 Android SDK (同 v5/v6)
           # ══════════════════════════════════════════════════════════
-          echo "🔧 Step 0: 安装 Android SDK 组件 (v6) ..."
+          echo "🔧 Step 0: 安装 Android SDK 组件 ..."
 
           ORIG_SDK=$(find /home/builder/lib -maxdepth 1 -name "android-sdk-*" -type d 2>/dev/null | head -1)
           SDK="/tmp/android-sdk"
 
           if [ -n "$ORIG_SDK" ]; then
-            echo "  原始 SDK: $ORIG_SDK"
-            echo "  复制到: $SDK ..."
+            echo "  原始 SDK: $ORIG_SDK → 复制到 $SDK ..."
             cp -a "$ORIG_SDK" "$SDK"
             chmod -R u+w "$SDK"
             echo "  ✅ SDK 复制完成 ($(du -sh "$SDK" | cut -f1))"
           else
-            echo "  ⚠️ 无原始 SDK，创建空目录"
             mkdir -p "$SDK"
           fi
 
           export ANDROID_HOME="$SDK"
           export ANDROID_SDK_ROOT="$SDK"
 
-          echo "  📂 build-tools:"
-          ls "$SDK/build-tools/" 2>/dev/null || echo "    (空)"
-          echo "  📂 platforms:"
-          ls "$SDK/platforms/" 2>/dev/null || echo "    (空)"
-          echo ""
-
-          # ── build-tools;30.0.3 ──────────────────────────────
+          # ── build-tools;30.0.3 ──
           BT_DIR="$SDK/build-tools/30.0.3"
           if [ -d "$BT_DIR" ] && { [ -f "$BT_DIR/aapt" ] || [ -f "$BT_DIR/aapt2" ]; }; then
             echo "  ✅ build-tools;30.0.3 已存在"
           else
             echo "  📥 下载 build-tools;30.0.3 ..."
-            BT_ZIP="/tmp/bt.zip"
-            curl -fSL --retry 3 -o "$BT_ZIP" \
+            curl -fSL --retry 3 -o /tmp/bt.zip \
               "https://dl.google.com/android/repository/build-tools_r30.0.3-linux.zip" 2>&1
             mkdir -p "$BT_DIR"
-            TMP="/tmp/bt-ex-$$"
-            mkdir -p "$TMP"
-            unzip -q -o "$BT_ZIP" -d "$TMP"
+            TMP="/tmp/bt-ex-$$"; mkdir -p "$TMP"
+            unzip -q -o /tmp/bt.zip -d "$TMP"
             INNER=$(find "$TMP" -name "aapt2" -o -name "aapt" 2>/dev/null | head -1)
             [ -n "$INNER" ] && INNER=$(dirname "$INNER")
             [ -z "$INNER" ] && INNER=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)
-            if [ -n "$INNER" ]; then
-              cp -a "$INNER"/. "$BT_DIR/"
-              echo "  ✅ build-tools 已安装"
-            fi
-            rm -rf "$TMP" "$BT_ZIP"
+            [ -n "$INNER" ] && cp -a "$INNER"/. "$BT_DIR/"
+            rm -rf "$TMP" /tmp/bt.zip
             cat > "$BT_DIR/source.properties" << 'BTSP'
           Pkg.Revision=30.0.3
           Pkg.Path=build-tools;30.0.3
           Pkg.Desc=Android SDK Build-Tools 30.0.3
           BTSP
-            echo "  ✅ source.properties 已创建"
+            echo "  ✅ build-tools 已安装"
           fi
 
-          # ── platforms;android-33 ─────────────────────────────
+          # ── platforms;android-33 ──
           PLAT_DIR="$SDK/platforms/android-33"
           if [ -d "$PLAT_DIR" ] && [ -f "$PLAT_DIR/android.jar" ]; then
             echo "  ✅ platforms;android-33 已存在"
           else
             echo "  📥 下载 platforms;android-33 ..."
-            PLAT_ZIP="/tmp/plat.zip"
             PLAT_OK=false
             for url in \
               "https://dl.google.com/android/repository/platform-33-ext7_r04.zip" \
@@ -178,26 +180,19 @@ jobs:
               "https://dl.google.com/android/repository/platform-33_r01.zip" \
             ; do
               echo "    尝试: $url"
-              if curl -fSL --retry 2 -o "$PLAT_ZIP" "$url" 2>&1; then
+              if curl -fSL --retry 2 -o /tmp/plat.zip "$url" 2>&1; then
                 PLAT_OK=true; break
               fi
             done
             if [ "$PLAT_OK" = true ]; then
               mkdir -p "$PLAT_DIR"
-              TMP="/tmp/plat-ex-$$"
-              mkdir -p "$TMP"
-              unzip -q -o "$PLAT_ZIP" -d "$TMP"
+              TMP="/tmp/plat-ex-$$"; mkdir -p "$TMP"
+              unzip -q -o /tmp/plat.zip -d "$TMP"
               INNER=$(find "$TMP" -name "android.jar" -type f -exec dirname {} \; 2>/dev/null | head -1)
               [ -z "$INNER" ] && INNER=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)
-              if [ -n "$INNER" ]; then
-                cp -a "$INNER"/. "$PLAT_DIR/"
-                echo "  ✅ platform 已安装"
-              fi
-              rm -rf "$TMP" "$PLAT_ZIP"
-            else
-              echo "  ❌ 所有 URL 失败，符号链接 fallback ..."
-              EXISTING=$(find "$SDK/platforms" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
-              [ -n "$EXISTING" ] && ln -sfn "$EXISTING" "$PLAT_DIR"
+              [ -n "$INNER" ] && cp -a "$INNER"/. "$PLAT_DIR/"
+              rm -rf "$TMP" /tmp/plat.zip
+              echo "  ✅ platform 已安装"
             fi
             cat > "$PLAT_DIR/source.properties" << 'PLATSP'
           Pkg.Revision=3
@@ -205,26 +200,18 @@ jobs:
           Pkg.Desc=Android SDK Platform 33
           AndroidVersion.ApiLevel=33
           PLATSP
-            echo "  ✅ source.properties 已创建"
           fi
 
-          # ── licenses + gradle ────────────────────────────────
+          # ── licenses + gradle ──
           mkdir -p "$SDK/licenses"
           printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee' > "$SDK/licenses/android-sdk-license"
           printf '\n84831b9409646a918e30573bab4c9c91346d8abd' > "$SDK/licenses/android-sdk-preview-license"
+          mkdir -p /home/builder/.gradle
+          echo "sdk.dir=$SDK" >> /home/builder/.gradle/gradle.properties
 
-          GRADLE_HOME="/home/builder/.gradle"
-          mkdir -p "$GRADLE_HOME"
-          echo "android.dir=$SDK" >> "$GRADLE_HOME/gradle.properties"
-          echo "sdk.dir=$SDK"     >> "$GRADLE_HOME/gradle.properties"
-          echo "  ✅ licenses + gradle.properties 已写入"
-
-          # ── 验证 ─────────────────────────────────────────────
-          echo ""
-          echo "  🔍 SDK 最终验证:"
-          echo "    ANDROID_HOME=$ANDROID_HOME"
-          { [ -f "$BT_DIR/aapt2" ] || [ -f "$BT_DIR/aapt" ]; } && echo "    ✅ build-tools;30.0.3" || echo "    ❌ build-tools;30.0.3"
-          [ -f "$PLAT_DIR/android.jar" ] && echo "    ✅ platforms;android-33" || echo "    ❌ platforms;android-33"
+          echo "  ANDROID_HOME=$ANDROID_HOME"
+          { [ -f "$BT_DIR/aapt2" ] || [ -f "$BT_DIR/aapt" ]; } && echo "  ✅ build-tools;30.0.3" || echo "  ❌ build-tools;30.0.3"
+          [ -f "$PLAT_DIR/android.jar" ] && echo "  ✅ platforms;android-33" || echo "  ❌ platforms;android-33"
           echo ""
 
           # ══════════════════════════════════════════════════════════
@@ -284,19 +271,7 @@ jobs:
           fi
 
           # ══════════════════════════════════════════════════════════
-          # Step 2: 本地 apt 仓库
-          #
-          # v6 修复: generate-bootstraps.sh 用 $REPO_URL/$Filename 下载
-          #   .deb 文件。Packages 索引中的 Filename 字段是 dpkg-scanpackages
-          #   运行目录的相对路径。
-          #
-          #   v5 的问题: .deb 放在 dists/stable/main/binary-aarch64/ 下，
-          #   dpkg-scanpackages 也在该目录运行 → Filename = ./xxx.deb
-          #   → 实际 curl 路径 = $REPO_URL/xxx.deb = /tmp/local-termux-repo/xxx.deb
-          #   → 但文件在 dists/stable/main/binary-aarch64/xxx.deb → 404!
-          #
-          #   v6 修复: .deb 文件放到仓库根目录, dpkg-scanpackages 也从
-          #   根目录运行, Packages 索引复制到 dists/stable/main/binary-aarch64/。
+          # Step 2: 本地 apt 仓库 (v6 修复: .deb 放仓库根目录)
           # ══════════════════════════════════════════════════════════
           echo "📂 Step 2: 创建本地 apt 仓库 ..."
 
@@ -304,14 +279,13 @@ jobs:
           LOCAL_REPO="/tmp/local-termux-repo"
           PACKAGES_DIR="${LOCAL_REPO}/dists/stable/main/binary-aarch64"
 
-          mkdir -p "$LOCAL_REPO"
-          mkdir -p "$PACKAGES_DIR"
+          mkdir -p "$LOCAL_REPO" "$PACKAGES_DIR"
 
           DEB_COUNT=$(find "$DEB_SOURCE" -name "*.deb" -type f 2>/dev/null | wc -l)
           echo "  找到 $DEB_COUNT 个 .deb 文件"
           [ "$DEB_COUNT" -eq 0 ] && { echo "❌ 无 .deb 文件！"; exit 1; }
 
-          # ⚠️ v6 关键修复: .deb 文件放到仓库根目录（不是 dists/ 子目录）
+          # .deb 放仓库根目录 (Filename 相对路径匹配)
           find "$DEB_SOURCE" -name "*.deb" -type f -exec cp {} "$LOCAL_REPO/" \;
 
           echo ""
@@ -320,28 +294,20 @@ jobs:
             F=$(find "$LOCAL_REPO" -maxdepth 1 -name "${p}_*.deb" -type f 2>/dev/null | head -1)
             [ -n "$F" ] && echo "    ✅ $p" || echo "    ❌ $p"
           done
-          echo ""
 
-          # 从仓库根目录运行 dpkg-scanpackages → Filename 相对于根目录
           cd "$LOCAL_REPO"
           dpkg-scanpackages --multiversion . /dev/null 2>/dev/null > Packages
           gzip -k Packages
-
           echo "  Packages 条目: $(grep -c '^Package:' Packages)"
-          echo "  Filename 示例: $(grep '^Filename:' Packages | head -1)"
-
-          # 将 Packages 索引复制到 apt 期望的目录结构
           cp Packages Packages.gz "$PACKAGES_DIR/"
-
           cd /home/builder/termux-packages
 
-          # 同时创建 binary-all 目录（避免 curl error 37 警告）
+          # binary-all 空索引 (避免 curl 37)
           ALL_DIR="${LOCAL_REPO}/dists/stable/main/binary-all"
           mkdir -p "$ALL_DIR"
           echo "" > "$ALL_DIR/Packages"
           gzip -k "$ALL_DIR/Packages"
 
-          # Release 文件
           cat > "${LOCAL_REPO}/dists/stable/Release" << 'RELEASE_EOF'
           Origin: termux-custom
           Label: termux-custom
@@ -356,8 +322,14 @@ jobs:
 
           # ══════════════════════════════════════════════════════════
           # Step 3: 生成 bootstrap zip
+          #
+          # v7: generate-bootstraps.sh 的 mv 已被 Phase 3 补丁改为输出到
+          #     ./output/ (可写), 不再输出到 ./ (不可写)
           # ══════════════════════════════════════════════════════════
           echo "🎯 Step 3: 生成 bootstrap.zip ..."
+
+          # 确保 output 目录存在
+          mkdir -p ./output
 
           bash scripts/generate-bootstraps.sh \
             --repository "file://${LOCAL_REPO}" \
@@ -365,21 +337,23 @@ jobs:
             2>&1 | tail -80
 
           echo ""
+          echo "🔍 查找 bootstrap zip ..."
           find . -name "bootstrap-*.zip" -type f 2>/dev/null
-          ls -lh bootstrap-*.zip 2>/dev/null || echo "  未找到 bootstrap zip"
+          find /tmp -maxdepth 2 -name "bootstrap-*.zip" -type f 2>/dev/null
+          ls -lh ./output/bootstrap-*.zip 2>/dev/null || \
+            ls -lh ./bootstrap-*.zip 2>/dev/null || \
+            echo "  ⚠️ 未找到 bootstrap zip"
+
           echo ""
           echo "✅ 构建流程完成！"
           SCRIPT_EOF
 
           chmod +x termux-packages/ci-build.sh
-          echo "✅ ci-build.sh 已生成 (v6)"
+          echo "✅ ci-build.sh 已生成 (v7)"
           echo ""
-          echo "=== v6 关键变更 ==="
-          echo "1. 修复本地仓库布局: .deb 文件放到仓库根目录"
-          echo "2. dpkg-scanpackages 从根目录运行 (Filename 路径正确)"
-          echo "3. Packages 索引复制到 dists/stable/main/binary-aarch64/"
-          echo "4. 创建空的 binary-all/Packages 避免 curl 37 警告"
-          echo "5. 保留 v5 所有修复 (SDK 复制到 /tmp)"
+          echo "=== v7 关键变更 ==="
+          echo "1. 补丁 generate-bootstraps.sh 的 mv 输出路径: ./ → ./output/"
+          echo "2. 修复 upload-artifact 冒号文件名问题"
 
       # ── Phase 5: Docker 构建 ─────────────────────────────────
       - name: "🐳 Docker 构建 (run-docker.sh)"
@@ -390,28 +364,46 @@ jobs:
           echo "=== 启动 Docker 构建 ==="
           echo "  包名: ${PACKAGE_NAME}"
           echo "  架构: aarch64"
-          echo "  额外包: ${EXTRA_PACKAGES:-无}"
           echo ""
 
           bash scripts/run-docker.sh bash ci-build.sh
 
-      # ── Phase 6: 收集产物 ─────────────────────────────────────
+      # ── Phase 6: 收集构建产物 ────────────────────────────────
       - name: "📦 收集构建产物"
         if: always()
         run: |
           echo "=== 查找 bootstrap zip ==="
           find termux-packages -name "bootstrap-*.zip" -type f 2>/dev/null
 
-          BOOTSTRAP=$(find termux-packages -name "bootstrap-aarch64.zip" -type f 2>/dev/null | head -1)
+          # 优先在 output/ 中查找 (v7 补丁后的输出路径)
+          BOOTSTRAP=$(find termux-packages/output -name "bootstrap-aarch64.zip" -type f 2>/dev/null | head -1)
+          # 回退到根目录
+          if [ -z "$BOOTSTRAP" ]; then
+            BOOTSTRAP=$(find termux-packages -maxdepth 1 -name "bootstrap-aarch64.zip" -type f 2>/dev/null | head -1)
+          fi
+
           if [ -n "$BOOTSTRAP" ]; then
             echo "✅ 找到: $BOOTSTRAP"
             ls -lh "$BOOTSTRAP"
             cp "$BOOTSTRAP" ./bootstrap-aarch64.zip
           else
             echo "⚠️ 未找到 bootstrap-aarch64.zip"
+            echo "=== termux-packages/ ==="
             ls -la termux-packages/
+            echo "=== termux-packages/output/ ==="
+            ls -la termux-packages/output/ 2>/dev/null | tail -20
+            echo "=== 所有 .zip ==="
             find termux-packages -name "*.zip" -type f 2>/dev/null
           fi
+
+          # v7: 重命名含冒号的 .deb 文件 (upload-artifact 不允许 : 字符)
+          echo ""
+          echo "=== 重命名含冒号的文件 ==="
+          find termux-packages/output -name "*:*" -type f 2>/dev/null | while read f; do
+            NEWNAME=$(echo "$f" | tr ':' '_')
+            echo "  重命名: $(basename "$f") → $(basename "$NEWNAME")"
+            mv "$f" "$NEWNAME"
+          done
 
       - name: "⬆️  上传 Artifact"
         if: always()
