@@ -1,0 +1,122 @@
+name: Build Custom Ubuntu RootFS
+
+on:
+  workflow_dispatch:          # 手动触发
+    inputs:
+      include_build_essential:
+        description: '是否包含 build-essential'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 2 1 */3 *'    # 每季度 1 号 UTC 2:00 自动构建
+
+permissions:
+  contents: write             # 需要推送 Release
+
+env:
+  ROOTFS_VERSION: "v1.0.0"
+  DISTRO: noble
+  ARCH: arm64
+  MIRROR: "http://ports.ubuntu.com/ubuntu-ports"
+
+jobs:
+  build-rootfs:
+    runs-on: ubuntu-24.04-arm   # GitHub 原生 ARM64 runner
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mmdebstrap xz-utils
+
+      - name: Define package list
+        id: packages
+        run: |
+          # 核心包
+          CORE_PKGS="python3,python3-pip,nodejs,npm,git,wget,curl"
+          CORE_PKGS="${CORE_PKGS},ca-certificates,locales,less,vim-tiny"
+          CORE_PKGS="${CORE_PKGS},openssh-client,jq"
+
+          # 可选 build-essential
+          if [ "${{ inputs.include_build_essential }}" = "true" ]; then
+            CORE_PKGS="${CORE_PKGS},build-essential"
+          fi
+
+          echo "packages=${CORE_PKGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build RootFS with mmdebstrap
+        run: |
+          sudo mmdebstrap \
+            --variant=minbase \
+            --architectures=${{ env.ARCH }} \
+            --include=${{ steps.packages.outputs.packages }} \
+            \
+            --customize-hook='
+              # 生成 locale
+              chroot "$1" sed -i "s/# en_US.UTF-8/en_US.UTF-8/" /etc/locale.gen
+              chroot "$1" sed -i "s/# zh_CN.UTF-8/zh_CN.UTF-8/" /etc/locale.gen
+              chroot "$1" locale-gen
+
+              # pip 基础工具
+              chroot "$1" pip3 install --break-system-packages setuptools wheel
+
+              # 清理缓存，压缩体积
+              chroot "$1" apt-get clean
+              chroot "$1" pip3 cache purge || true
+              chroot "$1" npm cache clean --force || true
+              rm -rf "$1"/var/lib/apt/lists/*
+              rm -rf "$1"/var/cache/apt/archives/*.deb
+              rm -rf "$1"/tmp/* "$1"/var/tmp/*
+              rm -rf "$1"/usr/share/doc/*
+              rm -rf "$1"/usr/share/man/*
+              rm -rf "$1"/usr/share/info/*
+              rm -rf "$1"/var/log/*.log
+            ' \
+            \
+            ${{ env.DISTRO }} \
+            rootfs/ \
+            "${{ env.MIRROR }}"
+
+      - name: Package RootFS
+        run: |
+          FILENAME="ubuntu-noble-custom-aarch64-${ROOTFS_VERSION}.tar.xz"
+
+          # 使用 tar + xz 压缩，多线程加速
+          cd rootfs
+          tar cf - . | xz -9 -T0 > "../${FILENAME}"
+          cd ..
+
+          # 输出构建信息
+          echo "## Build Info" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **File**: ${FILENAME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Size**: $(du -h ${FILENAME} | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Files**: $(find rootfs -type f | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Packages**: $(chroot rootfs dpkg -l 2>/dev/null | grep ^ii | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "filename=${FILENAME}" >> "$GITHUB_ENV"
+
+      - name: Checksum
+        run: |
+          sha256sum "${{ env.filename }}" > "${{ env.filename }}.sha256"
+          cat "${{ env.filename }}.sha256"
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-rootfs-${{ env.ROOTFS_VERSION }}
+          path: |
+            ${{ env.filename }}
+            ${{ env.filename }}.sha256
+          retention-days: 90
+
+      - name: Create Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.filename }}
+            ${{ env.filename }}.sha256
